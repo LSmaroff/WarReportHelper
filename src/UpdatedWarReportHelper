@@ -1,16 +1,17 @@
 # War Report Helper / Completed Tasks GUI
-# Version 3.2.2 - Nunito default font refresh.
+# Version 3.2.3 - Raw updater detection fix and task counters.
 
 param(
     [switch]$ShowUpdateComplete
 )
 
-$script:AppVersion = "3.2.2"
+$script:AppVersion = "3.2.3"
 $script:AppFontFamily = "Nunito, Segoe UI"
 $script:AppReleaseNotes = @(
-    "Changed the default application font to Nunito with Segoe UI as a fallback.",
-    "Updated WPF window font definitions so the main app, settings, update prompt, and edit dialog inherit Nunito by default.",
-    "Kept the raw GitHub updater workflow and existing non-update features unchanged."
+    "Fixed raw updater version detection so $script:AppVersion can be found anywhere in the update file, including compressed raw GitHub content.",
+    "Added plus and minus task counter buttons that appear when a task is hovered or selected.",
+    "Counters update repetitive tasks as (x2), (x3), etc. without needing to retype the task.",
+    "Editing a counted task now preserves the current counter value."
 )
 
 # Relaunch in STA mode if needed
@@ -1048,10 +1049,13 @@ function Get-ScriptVersionFromText {
         throw "The update file was empty."
     }
 
-    $match = [regex]::Match($ScriptText, '(?m)^\s*\$script:AppVersion\s*=\s*[''\"]([^''\"]+)[''\"]')
+    # Find AppVersion anywhere in the update file instead of only at the start of a line.
+    # Some restricted-network/raw GitHub paths can return compressed-looking text where
+    # `$script:AppVersion is not at the beginning of its own line.
+    $match = [regex]::Match($ScriptText, '\$script:AppVersion\s*=\s*[''"]([^''"]+)[''"]')
 
     if (-not $match.Success) {
-        throw "The update file does not contain a valid `$script:AppVersion value near the top."
+        throw "The update file does not contain a valid `$script:AppVersion value."
     }
 
     return [string]$match.Groups[1].Value
@@ -1556,6 +1560,49 @@ $mainXaml = @"
             </Style.Triggers>
         </Style>
 
+
+
+        <Style x:Key="CounterTaskButtonStyle" TargetType="{x:Type Button}">
+            <Setter Property="Visibility" Value="Collapsed"/>
+            <Setter Property="Width" Value="28"/>
+            <Setter Property="Height" Value="26"/>
+            <Setter Property="Padding" Value="0"/>
+            <Setter Property="Margin" Value="6,0,0,0"/>
+            <Setter Property="Foreground" Value="{DynamicResource EditButtonTextBrush}"/>
+            <Setter Property="Background" Value="{DynamicResource EditButtonBackgroundBrush}"/>
+            <Setter Property="BorderBrush" Value="Black"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="FontWeight" Value="Bold"/>
+            <Setter Property="FontSize" Value="15"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="{x:Type Button}">
+                        <Border
+                            Background="{TemplateBinding Background}"
+                            BorderBrush="{TemplateBinding BorderBrush}"
+                            BorderThickness="{TemplateBinding BorderThickness}"
+                            CornerRadius="7">
+                            <ContentPresenter
+                                HorizontalAlignment="Center"
+                                VerticalAlignment="Center"/>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding IsMouseOver, RelativeSource={RelativeSource AncestorType=ListBoxItem}}" Value="True">
+                    <Setter Property="Visibility" Value="Visible"/>
+                </DataTrigger>
+                <DataTrigger Binding="{Binding IsSelected, RelativeSource={RelativeSource AncestorType=ListBoxItem}}" Value="True">
+                    <Setter Property="Visibility" Value="Visible"/>
+                </DataTrigger>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Opacity" Value="0.85"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+
         <Style x:Key="DeleteTaskButtonStyle" TargetType="{x:Type Button}">
             <Setter Property="Visibility" Value="Collapsed"/>
             <Setter Property="Width" Value="30"/>
@@ -1867,6 +1914,8 @@ $mainXaml = @"
                                     <ColumnDefinition Width="*"/>
                                     <ColumnDefinition Width="Auto"/>
                                     <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="Auto"/>
                                 </Grid.ColumnDefinitions>
 
                                 <TextBlock
@@ -1877,12 +1926,26 @@ $mainXaml = @"
 
                                 <Button
                                     Grid.Column="1"
+                                    Content="−"
+                                    Tag="DecreaseTaskCount"
+                                    ToolTip="Decrease this task count"
+                                    Style="{StaticResource CounterTaskButtonStyle}"/>
+
+                                <Button
+                                    Grid.Column="2"
+                                    Content="+"
+                                    Tag="IncreaseTaskCount"
+                                    ToolTip="Increase this task count"
+                                    Style="{StaticResource CounterTaskButtonStyle}"/>
+
+                                <Button
+                                    Grid.Column="3"
                                     Content="Edit"
                                     Tag="EditTask"
                                     Style="{StaticResource EditTaskButtonStyle}"/>
 
                                 <Button
-                                    Grid.Column="2"
+                                    Grid.Column="4"
                                     Content="✕"
                                     Tag="DeleteTask"
                                     Style="{StaticResource DeleteTaskButtonStyle}"/>
@@ -2485,6 +2548,78 @@ function Normalize-TaskText {
     }
 
     return $value
+}
+
+
+function Get-TaskCountInfo {
+    param([string]$TaskText)
+
+    $text = [string]$TaskText
+    $count = 1
+    $baseText = $text.TrimEnd()
+
+    $match = [regex]::Match($baseText, '\s+\(x(\d+)\)\s*$')
+
+    if ($match.Success) {
+        $parsed = 1
+        if ([int]::TryParse($match.Groups[1].Value, [ref]$parsed)) {
+            $count = [Math]::Max(1, $parsed)
+            $baseText = $baseText.Substring(0, $match.Index).TrimEnd()
+        }
+    }
+
+    return [pscustomobject]@{
+        BaseText = $baseText
+        Count    = $count
+    }
+}
+
+function Set-TaskCountText {
+    param(
+        [string]$BaseText,
+        [int]$Count
+    )
+
+    $cleanBase = Normalize-TaskText $BaseText
+    $safeCount = [Math]::Max(1, [int]$Count)
+
+    if ($safeCount -le 1) {
+        return $cleanBase
+    }
+
+    return "$cleanBase (x$safeCount)"
+}
+
+function Change-TaskCounter {
+    param(
+        [int]$Index,
+        [int]$Delta
+    )
+
+    if ($Index -lt 0 -or $Index -ge $TaskList.Items.Count) {
+        return
+    }
+
+    $currentTask = [string]$TaskList.Items[$Index]
+    $info = Get-TaskCountInfo -TaskText $currentTask
+    $newCount = [Math]::Max(1, ([int]$info.Count + [int]$Delta))
+    $newText = Set-TaskCountText -BaseText $info.BaseText -Count $newCount
+
+    $TaskList.Items[$Index] = $newText
+
+    if ($script:IsViewingPreviousList) {
+        Mark-DisplayedListDirty
+    }
+
+    Save-Config
+    Update-TaskCount
+
+    if ($script:IsViewingPreviousList) {
+        Set-StatusMessage "Previous list task count updated to x$newCount. Changes are not saved to that file yet."
+    }
+    else {
+        Set-StatusMessage "Task count updated to x$newCount."
+    }
 }
 
 function Show-EditTaskWindow {
@@ -4236,7 +4371,15 @@ $TaskList.AddHandler(
             return
         }
 
-        if ([string]$button.Tag -eq "DeleteTask") {
+        if ([string]$button.Tag -eq "IncreaseTaskCount") {
+            Change-TaskCounter -Index $index -Delta 1
+            $e.Handled = $true
+        }
+        elseif ([string]$button.Tag -eq "DecreaseTaskCount") {
+            Change-TaskCounter -Index $index -Delta -1
+            $e.Handled = $true
+        }
+        elseif ([string]$button.Tag -eq "DeleteTask") {
             $removedTask = [string]$TaskList.Items[$index]
             $TaskList.Items.RemoveAt($index)
 
@@ -4258,10 +4401,11 @@ $TaskList.AddHandler(
         }
         elseif ([string]$button.Tag -eq "EditTask") {
             $originalTask = [string]$TaskList.Items[$index]
-            $editResult = Show-EditTaskWindow $originalTask
+            $taskInfo = Get-TaskCountInfo -TaskText $originalTask
+            $editResult = Show-EditTaskWindow $taskInfo.BaseText
 
             if ($editResult.Saved) {
-                $TaskList.Items[$index] = [string]$editResult.Text
+                $TaskList.Items[$index] = Set-TaskCountText -BaseText ([string]$editResult.Text) -Count ([int]$taskInfo.Count)
 
                 if ($script:IsViewingPreviousList) {
                     Mark-DisplayedListDirty
