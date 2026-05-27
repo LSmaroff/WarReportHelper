@@ -1,17 +1,16 @@
 # War Report Helper / Completed Tasks GUI
-# Version 3.2.1 - Raw GitHub update workflow and updater cleanup.
+# Version 3.2.2 - Nunito default font refresh.
 
 param(
     [switch]$ShowUpdateComplete
 )
 
-$script:AppVersion = "3.2.1"
+$script:AppVersion = "3.2.2"
+$script:AppFontFamily = "Nunito, Segoe UI"
 $script:AppReleaseNotes = @(
-    "Reworked updates to use the raw GitHub UpdatedWarReportHelper file instead of direct PS1 release downloads.",
-    "Added startup update prompt with Later and Update Now choices.",
-    "Added safe script replacement with backup and automatic relaunch after updating.",
-    "Added update completion popup showing the version installed and change details.",
-    "Preserved weekly task tracking, previous-list viewing, themes, dynamic task sizing, and dad joke display."
+    "Changed the default application font to Nunito with Segoe UI as a fallback.",
+    "Updated WPF window font definitions so the main app, settings, update prompt, and edit dialog inherit Nunito by default.",
+    "Kept the raw GitHub updater workflow and existing non-update features unchanged."
 )
 
 # Relaunch in STA mode if needed
@@ -1143,7 +1142,7 @@ function Show-UpdatePromptWindow {
     MinHeight="300"
     WindowStartupLocation="CenterOwner"
     ResizeMode="NoResize"
-    FontFamily="Segoe UI"
+    FontFamily="Nunito, Segoe UI"
     Background="#FFF5F7FB">
 
     <Border x:Name="PromptRoot" Padding="18" Background="#FFF5F7FB">
@@ -1409,7 +1408,7 @@ $mainXaml = @"
     MinWidth="580"
     MinHeight="450"
     WindowStartupLocation="CenterScreen"
-    FontFamily="Segoe UI"
+    FontFamily="Nunito, Segoe UI"
     Background="#FFF5F7FB"
     WindowStyle="None"
     ResizeMode="CanResizeWithGrip"
@@ -2501,7 +2500,7 @@ function Show-EditTaskWindow {
     MinWidth="420"
     MinHeight="210"
     WindowStartupLocation="CenterOwner"
-    FontFamily="Segoe UI"
+    FontFamily="Nunito, Segoe UI"
     Background="#FFF5F7FB"
     UseLayoutRounding="True"
     SnapsToDevicePixels="True"
@@ -2954,7 +2953,7 @@ function Open-SettingsWindow {
     MinWidth="620"
     MinHeight="680"
     WindowStartupLocation="CenterOwner"
-    FontFamily="Segoe UI"
+    FontFamily="Nunito, Segoe UI"
     Background="#FFF5F7FB"
     UseLayoutRounding="True"
     SnapsToDevicePixels="True"
