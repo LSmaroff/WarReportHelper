@@ -1,11 +1,11 @@
 # War Report Helper / Completed Tasks GUI
-# Version 3.2.8 - Structured dad joke file parsing.
+# Version 3.2.9 - Robust GitHub dad joke parsing.
 
 param(
     [switch]$ShowUpdateComplete
 )
 
-$script:AppVersion = "3.2.8"
+$script:AppVersion = "3.2.9"
 $script:AppFontFamily = "Nunito, Segoe UI"
 $script:AvailableFontFamilies = @(
     "Nunito, Segoe UI",
@@ -21,10 +21,9 @@ $script:AvailableFontFamilies = @(
     "Consolas"
 )
 $script:AppReleaseNotes = @(
-    "Changed the dad joke file format to structured JSON so multi-line jokes stay grouped as one joke.",
-    "Updated dad joke parsing to support the new jokes/dadjokes JSON format and preserve compatibility with the old line-based file.",
-    "Normalized downloaded jokes for display so embedded line breaks do not split a single joke into multiple separate jokes.",
-    "Added an updated dad joke builder script that exports GitHub-ready JSON."
+    "Fixed dad joke loading from the GitHub jokes/dadjokes file by adding robust parsing for JSON, malformed multiline JSON-like joke files, delimiter files, and legacy line-based files.",
+    "Added automatic GitHub blob-to-raw URL conversion for the dad joke source so the app still pulls the raw file if a normal GitHub file page URL is used.",
+    "Improved dad joke normalization so multiline jokes are treated as one joke and displayed as a single readable line instead of falling back to the offline joke."
 )
 
 # Relaunch in STA mode if needed
@@ -2891,6 +2890,54 @@ function Set-DadJokeText {
     catch {}
 }
 
+function Convert-GitHubBlobUrlToRawUrl {
+    param([string]$Url)
+
+    if ([string]::IsNullOrWhiteSpace($Url)) {
+        return $Url
+    }
+
+    try {
+        $trimmedUrl = $Url.Trim()
+
+        if ($trimmedUrl -match '^https://github\.com/([^/]+)/([^/]+)/blob/([^/]+)/(.*)$') {
+            $owner = $matches[1]
+            $repo = $matches[2]
+            $branch = $matches[3]
+            $path = $matches[4]
+            return "https://raw.githubusercontent.com/$owner/$repo/refs/heads/$branch/$path"
+        }
+
+        return $trimmedUrl
+    }
+    catch {
+        return $Url
+    }
+}
+
+function Decode-DadJokeJsonStringValue {
+    param([string]$Value)
+
+    if ($null -eq $Value) {
+        return ""
+    }
+
+    try {
+        # The GitHub dadjokes file may contain actual newlines inside a quoted JSON value.
+        # Escape those control characters before asking ConvertFrom-Json to decode \uXXXX, \" and similar sequences.
+        $safeValue = [string]$Value
+        $safeValue = $safeValue -replace "`r`n", "\n"
+        $safeValue = $safeValue -replace "`n", "\n"
+        $safeValue = $safeValue -replace "`r", "\n"
+
+        $jsonString = '"' + $safeValue + '"'
+        return [string]($jsonString | ConvertFrom-Json)
+    }
+    catch {
+        return [string]$Value
+    }
+}
+
 function Select-DadJokeFromRawText {
     param([string]$RawText)
 
@@ -2914,6 +2961,27 @@ function Select-DadJokeFromRawText {
         }
     }
 
+    function Add-DadJokesFromMalformedJsonLikeText {
+        param([string]$Text)
+
+        if ([string]::IsNullOrWhiteSpace($Text)) {
+            return
+        }
+
+        # Handles the GitHub-hosted dadjokes file even if joke strings contain literal line breaks,
+        # which makes the file fail strict JSON parsing. It extracts each "joke" value up to the next object.
+        $pattern = '(?s)"joke"\s*:\s*"(?<joke>.*?)(?="\s*\}\s*,\s*\{\s*"id"\s*:|"\s*\}\s*\]\s*\}|"\s*\}\s*$)'
+        $matches = [regex]::Matches($Text, $pattern)
+
+        foreach ($match in $matches) {
+            if ($match.Success) {
+                $rawJoke = [string]$match.Groups['joke'].Value
+                $decodedJoke = Decode-DadJokeJsonStringValue $rawJoke
+                Add-DadJokeCandidate $decodedJoke
+            }
+        }
+    }
+
     if ([string]::IsNullOrWhiteSpace($RawText)) {
         return $script:DadJokeFallback
     }
@@ -2923,35 +2991,47 @@ function Select-DadJokeFromRawText {
         $trimmed = $trimmed.Trim([char]0xFEFF)
 
         if ($trimmed.StartsWith("{") -or $trimmed.StartsWith("[")) {
-            $jsonRoot = $trimmed | ConvertFrom-Json -Depth 12
-            $items = @()
+            try {
+                $jsonRoot = $trimmed | ConvertFrom-Json -Depth 20
+                $items = @()
 
-            if ($jsonRoot -is [System.Array]) {
-                $items = @($jsonRoot)
-            }
-            elseif ($null -ne $jsonRoot.jokes) {
-                $items = @($jsonRoot.jokes)
-            }
-            elseif ($null -ne $jsonRoot.items) {
-                $items = @($jsonRoot.items)
-            }
-            else {
-                $items = @($jsonRoot)
-            }
+                if ($jsonRoot -is [System.Array]) {
+                    $items = @($jsonRoot)
+                }
+                elseif ($null -ne $jsonRoot.jokes) {
+                    $items = @($jsonRoot.jokes)
+                }
+                elseif ($null -ne $jsonRoot.items) {
+                    $items = @($jsonRoot.items)
+                }
+                else {
+                    $items = @($jsonRoot)
+                }
 
-            foreach ($item in $items) {
-                if ($item -is [string]) {
-                    Add-DadJokeCandidate $item
+                foreach ($item in $items) {
+                    if ($item -is [string]) {
+                        Add-DadJokeCandidate $item
+                    }
+                    elseif ($null -ne $item.jokeBase64) {
+                        try {
+                            $decodedBytes = [Convert]::FromBase64String([string]$item.jokeBase64)
+                            Add-DadJokeCandidate ([System.Text.Encoding]::UTF8.GetString($decodedBytes))
+                        }
+                        catch {}
+                    }
+                    elseif ($null -ne $item.joke) {
+                        Add-DadJokeCandidate $item.joke
+                    }
+                    elseif ($null -ne $item.text) {
+                        Add-DadJokeCandidate $item.text
+                    }
+                    elseif ($null -ne $item.value) {
+                        Add-DadJokeCandidate $item.value
+                    }
                 }
-                elseif ($null -ne $item.joke) {
-                    Add-DadJokeCandidate $item.joke
-                }
-                elseif ($null -ne $item.text) {
-                    Add-DadJokeCandidate $item.text
-                }
-                elseif ($null -ne $item.value) {
-                    Add-DadJokeCandidate $item.value
-                }
+            }
+            catch {
+                Add-DadJokesFromMalformedJsonLikeText $trimmed
             }
         }
         elseif ($trimmed -match "(?m)^\s*---JOKE---\s*$") {
@@ -2960,6 +3040,22 @@ function Select-DadJokeFromRawText {
             foreach ($block in $blocks) {
                 Add-DadJokeCandidate $block
             }
+        }
+        elseif ($trimmed -match "(?m)^\s*WRH-DADJOKE\|") {
+            $lines = $trimmed -split "`r?`n"
+
+            foreach ($line in $lines) {
+                if ($line -match '^\s*WRH-DADJOKE\|[^|]*\|(?<payload>.+?)\s*$') {
+                    try {
+                        $bytes = [Convert]::FromBase64String($matches['payload'])
+                        Add-DadJokeCandidate ([System.Text.Encoding]::UTF8.GetString($bytes))
+                    }
+                    catch {}
+                }
+            }
+        }
+        elseif ($trimmed -match '"joke"\s*:') {
+            Add-DadJokesFromMalformedJsonLikeText $trimmed
         }
         else {
             # Legacy fallback: one joke per line.
@@ -3004,6 +3100,8 @@ function Start-DadJokeLoad {
         if ([string]::IsNullOrWhiteSpace($jokeUrl)) {
             $jokeUrl = "https://raw.githubusercontent.com/LSmaroff/WarReportHelper/refs/heads/main/jokes/dadjokes"
         }
+
+        $jokeUrl = Convert-GitHubBlobUrlToRawUrl $jokeUrl
 
         $client = New-Object System.Net.WebClient
         $client.Encoding = [System.Text.Encoding]::UTF8
