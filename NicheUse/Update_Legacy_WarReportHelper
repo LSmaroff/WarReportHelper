@@ -1,0 +1,72 @@
+# Quick legacy updater for War Report Helper
+# This replaces the installed WarReportHelper.ps1 with the latest raw GitHub version.
+
+$ErrorActionPreference = "Stop"
+
+$UpdateUrl = "https://raw.githubusercontent.com/LSmaroff/WarReportHelper/refs/heads/main/src/UpdatedWarReportHelper"
+
+$InstallFolder = Join-Path ([Environment]::GetFolderPath("MyDocuments")) "War Report Helper"
+$TargetScript = Join-Path $InstallFolder "WarReportHelper.ps1"
+$BackupFolder = Join-Path $InstallFolder "Backups"
+
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+    if (-not (Test-Path $InstallFolder)) {
+        throw "Install folder not found: $InstallFolder"
+    }
+
+    if (-not (Test-Path $TargetScript)) {
+        throw "Existing script not found: $TargetScript"
+    }
+
+    if (-not (Test-Path $BackupFolder)) {
+        New-Item -ItemType Directory -Path $BackupFolder -Force | Out-Null
+    }
+
+    $timestamp = Get-Date -Format "MM-dd-yyyy_HH-mm-ss"
+    $backupPath = Join-Path $BackupFolder "WarReportHelper_Backup_$timestamp.ps1"
+
+    Write-Host "Downloading latest War Report Helper script..."
+    $updatedScript = Invoke-WebRequest -Uri $UpdateUrl -UseBasicParsing -Headers @{
+        "User-Agent" = "WarReportHelper-LegacyUpdater"
+    }
+
+    $scriptText = $updatedScript.Content
+
+    if ([string]::IsNullOrWhiteSpace($scriptText)) {
+        throw "Downloaded update was empty."
+    }
+
+    if ($scriptText -notmatch '\$script:AppVersion') {
+        throw "Downloaded file does not look like a valid War Report Helper script."
+    }
+
+    Write-Host "Backing up current script..."
+    Copy-Item -Path $TargetScript -Destination $backupPath -Force
+
+    Write-Host "Installing update..."
+    Set-Content -Path $TargetScript -Value $scriptText -Encoding UTF8 -Force
+
+    Write-Host ""
+    Write-Host "Update complete."
+    Write-Host "Backup saved to: $backupPath"
+    Write-Host ""
+
+    $answer = Read-Host "Launch War Report Helper now? (Y/N)"
+    if ($answer -match '^(Y|y)') {
+        Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @(
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-STA",
+            "-File", "`"$TargetScript`""
+        )
+    }
+}
+catch {
+    Write-Host ""
+    Write-Host "Update failed:"
+    Write-Host $_.Exception.Message
+    Write-Host ""
+    Read-Host "Press Enter to close"
+}
