@@ -1,11 +1,11 @@
 # War Report Helper / Completed Tasks GUI
-# Version 3.2.5 - title button, font selector, and live preview polish.
+# Version 3.2.6 - update relaunch and button display fixes.
 
 param(
     [switch]$ShowUpdateComplete
 )
 
-$script:AppVersion = "3.2.5"
+$script:AppVersion = "3.2.6"
 $script:AppFontFamily = "Nunito, Segoe UI"
 $script:AvailableFontFamilies = @(
     "Nunito, Segoe UI",
@@ -21,11 +21,10 @@ $script:AvailableFontFamilies = @(
     "Consolas"
 )
 $script:AppReleaseNotes = @(
-    "Changed the custom title bar maximize button to use a clearer square icon.",
-    "Improved the Settings font selector with a themed animated dropdown so font names stay readable across themes.",
-    "Added Comic Sans MS as an included font option.",
-    "Adjusted the live preview delete button spacing so it is no longer cut off.",
-    "Kept the raw updater workflow, task counters, weekly tracking, themes, dad joke display, and previous-list viewing intact."
+    "Fixed the custom title bar maximize button by replacing the Unicode symbol with a vector-drawn square.",
+    "Fixed update relaunch behavior by quoting the installed script path correctly when restarting after an update.",
+    "Widened task Edit buttons and live preview buttons so labels are no longer cut off.",
+    "Kept the raw updater workflow, font selector, task counters, weekly tracking, themes, dad joke display, and previous-list viewing intact."
 )
 
 # Relaunch in STA mode if needed
@@ -1396,7 +1395,8 @@ try {
     `$markerJson = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$markerBase64'))
     [System.IO.File]::WriteAllText(`$completeFile, `$markerJson, [System.Text.Encoding]::UTF8)
 
-    Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-STA','-File',`$targetScript,'-ShowUpdateComplete')
+    `$launchArgs = '-NoProfile -ExecutionPolicy Bypass -STA -File "' + `$targetScript + '" -ShowUpdateComplete'
+    Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList `$launchArgs
 }
 catch {
     [System.Windows.Forms.MessageBox]::Show('The War Report Helper update failed: ' + `$_.Exception.Message, 'Update Failed') | Out-Null
@@ -1406,7 +1406,8 @@ catch {
         $applyContent | Set-Content -Path $applyScript -Encoding UTF8
 
         Set-StatusMessage "Applying update to v$($UpdateInfo.LatestVersion)..."
-        Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File', $applyScript)
+        $applyArgs = '-NoProfile -ExecutionPolicy Bypass -File "' + $applyScript + '"'
+        Start-Process -FilePath powershell.exe -WindowStyle Hidden -ArgumentList $applyArgs
         $script:MainWindow.Close()
     }
     catch {
@@ -1572,8 +1573,8 @@ $mainXaml = @"
 
         <Style x:Key="EditTaskButtonStyle" TargetType="{x:Type Button}">
             <Setter Property="Visibility" Value="Collapsed"/>
-            <Setter Property="Width" Value="34"/>
-            <Setter Property="Height" Value="26"/>
+            <Setter Property="Width" Value="58"/>
+            <Setter Property="Height" Value="28"/>
             <Setter Property="Padding" Value="0"/>
             <Setter Property="Margin" Value="8,0,0,0"/>
             <Setter Property="Foreground" Value="{DynamicResource EditButtonTextBrush}"/>
@@ -1764,11 +1765,21 @@ $mainXaml = @"
                         ToolTip="Minimize"/>
                     <Button
                         x:Name="MaximizeWindowButton"
-                        Content="☐"
                         Width="46"
                         Height="34"
                         Style="{StaticResource TopBarButton}"
-                        ToolTip="Maximize or restore"/>
+                        ToolTip="Maximize or restore">
+                        <Canvas Width="14" Height="14" HorizontalAlignment="Center" VerticalAlignment="Center">
+                            <Rectangle
+                                Width="10"
+                                Height="10"
+                                Canvas.Left="2"
+                                Canvas.Top="2"
+                                Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"
+                                StrokeThickness="2"
+                                Fill="Transparent"/>
+                        </Canvas>
+                    </Button>
                     <Button
                         x:Name="CloseWindowButton"
                         Content="X"
@@ -3915,7 +3926,7 @@ function Open-SettingsWindow {
     $previewHoverRow.Padding = [System.Windows.Thickness]::new(8, 5, 8, 5)
     $hoverGrid = New-Object System.Windows.Controls.Grid
     $previewHoverRow.Child = $hoverGrid
-    foreach ($width in @("*", "68", "50")) {
+    foreach ($width in @("*", "84", "58")) {
         $col = New-Object System.Windows.Controls.ColumnDefinition
         if ($width -eq "*") { $col.Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star) } else { $col.Width = [System.Windows.GridLength]::new([double]$width) }
         [void]$hoverGrid.ColumnDefinitions.Add($col)
@@ -3926,18 +3937,18 @@ function Open-SettingsWindow {
     [System.Windows.Controls.Grid]::SetColumn($previewHoverText, 0)
     [void]$hoverGrid.Children.Add($previewHoverText)
     $previewEditButton = New-SettingsButton "Edit"
-    $previewEditButton.Width = 60
-    $previewEditButton.Height = 30
+    $previewEditButton.Width = 76
+    $previewEditButton.Height = 34
     $previewEditButton.Padding = [System.Windows.Thickness]::new(0)
     $previewEditButton.Margin = [System.Windows.Thickness]::new(6, 0, 4, 0)
     $previewEditButton.VerticalAlignment = "Center"
     [System.Windows.Controls.Grid]::SetColumn($previewEditButton, 1)
     [void]$hoverGrid.Children.Add($previewEditButton)
     $previewDeleteButton = New-SettingsButton "X"
-    $previewDeleteButton.Width = 42
-    $previewDeleteButton.Height = 30
+    $previewDeleteButton.Width = 50
+    $previewDeleteButton.Height = 34
     $previewDeleteButton.Padding = [System.Windows.Thickness]::new(0)
-    $previewDeleteButton.Margin = [System.Windows.Thickness]::new(4, 0, 2, 0)
+    $previewDeleteButton.Margin = [System.Windows.Thickness]::new(4, 0, 0, 0)
     $previewDeleteButton.VerticalAlignment = "Center"
     [System.Windows.Controls.Grid]::SetColumn($previewDeleteButton, 2)
     [void]$hoverGrid.Children.Add($previewDeleteButton)
