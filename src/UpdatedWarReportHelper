@@ -1,11 +1,11 @@
 # War Report Helper / Completed Tasks GUI
-# Version 3.2.6 - update relaunch and button display fixes.
+# Version 3.2.7 - GitHub raw dad joke list.
 
 param(
     [switch]$ShowUpdateComplete
 )
 
-$script:AppVersion = "3.2.6"
+$script:AppVersion = "3.2.7"
 $script:AppFontFamily = "Nunito, Segoe UI"
 $script:AvailableFontFamilies = @(
     "Nunito, Segoe UI",
@@ -21,10 +21,11 @@ $script:AvailableFontFamilies = @(
     "Consolas"
 )
 $script:AppReleaseNotes = @(
-    "Fixed the custom title bar maximize button by replacing the Unicode symbol with a vector-drawn square.",
-    "Fixed update relaunch behavior by quoting the installed script path correctly when restarting after an update.",
-    "Widened task Edit buttons and live preview buttons so labels are no longer cut off.",
-    "Kept the raw updater workflow, font selector, task counters, weekly tracking, themes, dad joke display, and previous-list viewing intact."
+    "Changed dad joke loading to use the GitHub raw jokes file instead of calling the Dad Joke API from every client.",
+    "Added a DadJokesRawUrl setting pointed to the LSmaroff/WarReportHelper jokes/dadjokes raw file.",
+    "Added UTF-8/raw-text joke parsing that randomly selects a joke from the downloaded list and falls back safely when offline.",
+    "Clarified updater targeting so updates replace the installed script under the current user Documents\War Report Helper folder when present.",
+    "Kept update detection, task counters, weekly tracking, themes, font selection, and previous-list viewing intact."
 )
 
 # Relaunch in STA mode if needed
@@ -136,6 +137,7 @@ $script:DefaultSettings = [ordered]@{
     AutoSaveIntervalMinutes     = 60
 
     UpdateRawUrl                = "https://raw.githubusercontent.com/LSmaroff/WarReportHelper/refs/heads/main/src/UpdatedWarReportHelper"
+    DadJokesRawUrl              = "https://raw.githubusercontent.com/LSmaroff/WarReportHelper/refs/heads/main/jokes/dadjokes"
     CheckForUpdatesOnStartup    = $true
     LastWorkWeekMonday          = ""
 
@@ -1041,6 +1043,22 @@ function Initialize-WorkWeekTracking {
     catch {}
 }
 
+function Get-InstalledScriptPath {
+    $documentsFolder = [Environment]::GetFolderPath("MyDocuments")
+    $installedFolder = Join-Path $documentsFolder "War Report Helper"
+    $installedScript = Join-Path $installedFolder "WarReportHelper.ps1"
+
+    if (Test-Path $installedScript) {
+        return $installedScript
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($PSCommandPath)) {
+        return $PSCommandPath
+    }
+
+    return (Join-Path $script:ScriptDirectory "WarReportHelper.ps1")
+}
+
 function Compare-VersionString {
     param(
         [string]$Left,
@@ -1333,11 +1351,7 @@ function Start-AppUpdate {
             Show-AppMessage -Message "No newer update was found. Current version: v$script:AppVersion. Latest scanned version: v$($UpdateInfo.LatestVersion)." -Title "No Update Available" -Image ([System.Windows.MessageBoxImage]::Information)
             return
         }
-
-        $targetScript = $PSCommandPath
-        if ([string]::IsNullOrWhiteSpace($targetScript)) {
-            $targetScript = Join-Path $script:ScriptDirectory "WarReportHelper.ps1"
-        }
+        $targetScript = Get-InstalledScriptPath
 
         $downloadPath = Write-UpdateTextToTempFile -ScriptText $UpdateInfo.ScriptText
 
@@ -2878,6 +2892,61 @@ function Set-DadJokeText {
     catch {}
 }
 
+function Select-DadJokeFromRawText {
+    param([string]$RawText)
+
+    $jokes = New-Object System.Collections.ArrayList
+
+    if ([string]::IsNullOrWhiteSpace($RawText)) {
+        return $script:DadJokeFallback
+    }
+
+    try {
+        $trimmed = $RawText.Trim()
+
+        if ($trimmed.StartsWith("[")) {
+            $jsonItems = $trimmed | ConvertFrom-Json
+
+            foreach ($item in @($jsonItems)) {
+                $candidate = ""
+
+                if ($item -is [string]) {
+                    $candidate = [string]$item
+                }
+                elseif ($null -ne $item.joke) {
+                    $candidate = [string]$item.joke
+                }
+
+                $candidate = $candidate.Trim()
+
+                if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+                    [void]$jokes.Add($candidate)
+                }
+            }
+        }
+        else {
+            $lines = $RawText -split "`r?`n"
+
+            foreach ($line in $lines) {
+                $candidate = ([string]$line).Trim()
+
+                if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+                    [void]$jokes.Add($candidate)
+                }
+            }
+        }
+    }
+    catch {
+        return $script:DadJokeFallback
+    }
+
+    if ($jokes.Count -le 0) {
+        return $script:DadJokeFallback
+    }
+
+    return [string](Get-Random -InputObject @($jokes))
+}
+
 function Start-DadJokeLoad {
     if ($null -eq $script:JokeBlockControl) {
         return
@@ -2896,9 +2965,17 @@ function Start-DadJokeLoad {
             try { $script:DadJokeWebClient.Dispose() } catch {}
         }
 
+        $jokeUrl = [string]$script:S["DadJokesRawUrl"]
+
+        if ([string]::IsNullOrWhiteSpace($jokeUrl)) {
+            $jokeUrl = "https://raw.githubusercontent.com/LSmaroff/WarReportHelper/refs/heads/main/jokes/dadjokes"
+        }
+
         $client = New-Object System.Net.WebClient
+        $client.Encoding = [System.Text.Encoding]::UTF8
         $client.Headers.Add("Accept", "text/plain")
-        $client.Headers.Add("User-Agent", "WarReportHelper Task Tracker")
+        $client.Headers.Add("Cache-Control", "no-cache")
+        $client.Headers.Add("User-Agent", "WarReportHelper/$script:AppVersion")
         $script:DadJokeWebClient = $client
 
         $client.add_DownloadStringCompleted({
@@ -2908,11 +2985,7 @@ function Start-DadJokeLoad {
 
             try {
                 if (-not $eventArgs.Cancelled -and $null -eq $eventArgs.Error) {
-                    $apiText = ([string]$eventArgs.Result).Trim()
-
-                    if (-not [string]::IsNullOrWhiteSpace($apiText)) {
-                        $finalJoke = $apiText
-                    }
+                    $finalJoke = Select-DadJokeFromRawText -RawText ([string]$eventArgs.Result)
                 }
             }
             catch {
@@ -2924,7 +2997,7 @@ function Start-DadJokeLoad {
             try { $sender.Dispose() } catch {}
         })
 
-        $client.DownloadStringAsync([Uri]"https://icanhazdadjoke.com/")
+        $client.DownloadStringAsync([Uri]$jokeUrl)
     }
     catch {
         Set-DadJokeText $script:DadJokeFallback
