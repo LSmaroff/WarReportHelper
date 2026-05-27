@@ -1,17 +1,29 @@
 # War Report Helper / Completed Tasks GUI
-# Version 1.5.0 - Raw GitHub update workflow and updater cleanup.
+# Version 3.2.4 - updater relaunch, safe button symbols, and font selector.
 
 param(
     [switch]$ShowUpdateComplete
 )
 
-$script:AppVersion = "1.5.0"
+$script:AppVersion = "3.2.4"
+$script:AppFontFamily = "Nunito, Segoe UI"
+$script:AvailableFontFamilies = @(
+    "Nunito, Segoe UI",
+    "Segoe UI",
+    "Aptos",
+    "Calibri",
+    "Arial",
+    "Verdana",
+    "Tahoma",
+    "Trebuchet MS",
+    "Georgia",
+    "Consolas"
+)
 $script:AppReleaseNotes = @(
-    "Reworked updates to use the raw GitHub UpdatedWarReportHelper file instead of direct PS1 release downloads.",
-    "Added startup update prompt with Later and Update Now choices.",
-    "Added safe script replacement with backup and automatic relaunch after updating.",
-    "Added update completion popup showing the version installed and change details.",
-    "Preserved weekly task tracking, previous-list viewing, themes, dynamic task sizing, and dad joke display."
+    "Improved the raw updater so downloaded update text is decoded as UTF-8 and the app relaunches automatically after updating.",
+    "Replaced fragile symbol-based title bar and task buttons with ASCII/vector-safe controls to prevent strange character display after updates.",
+    "Added an included font selector in Settings so users can choose a more readable app font.",
+    "Kept task counters, weekly tracking, themes, dad joke display, and previous-list viewing intact."
 )
 
 # Relaunch in STA mode if needed
@@ -86,6 +98,7 @@ $script:DefaultSettings = [ordered]@{
     ListFontSize                = 15
     DynamicListFontSizing       = $true
     InputFontSize               = 14
+    AppFontFamily               = "Nunito, Segoe UI"
 
     TitleFontColor              = "#FF1E293B"
     TitleOutlineColor           = "#FFFFFFFF"
@@ -131,7 +144,7 @@ $script:DefaultSettings = [ordered]@{
 }
 
 $script:AppearanceKeys = @(
-    "TitleFontSize", "SubtitleFontSize", "SectionLabelFontSize", "ListFontSize", "InputFontSize",
+    "TitleFontSize", "SubtitleFontSize", "SectionLabelFontSize", "ListFontSize", "InputFontSize", "AppFontFamily",
     "TitleFontColor", "TitleOutlineColor", "SubtitleFontColor", "SectionLabelFontColor",
     "ListFontColor", "InputFontColor", "PlaceholderTextColor", "ButtonFontColor",
     "ListHoverTextColor", "SettingsMenuTextColor", "EditButtonFontColor", "DeleteButtonFontColor", "StatusTextColor",
@@ -145,9 +158,9 @@ foreach ($key in $script:DefaultSettings.Keys) {
 }
 
 $script:SavedTasks = @(
-    "• Checked email",
-    "• Completed morning report",
-    "• Updated task tracker"
+    "- Checked email",
+    "- Completed morning report",
+    "- Updated task tracker"
 )
 
 $script:MainWindow = $null
@@ -621,8 +634,9 @@ function Read-TaskListFile {
                 continue
             }
 
-            if ($trimmed.StartsWith("•")) {
-                $tasks += $trimmed
+            $legacyBullet = [string][char]0x2022
+            if ($trimmed.StartsWith("- ") -or $trimmed.StartsWith($legacyBullet)) {
+                $tasks += (Normalize-TaskText $trimmed)
                 continue
             }
 
@@ -1049,10 +1063,13 @@ function Get-ScriptVersionFromText {
         throw "The update file was empty."
     }
 
-    $match = [regex]::Match($ScriptText, '(?m)^\s*\$script:AppVersion\s*=\s*[''\"]([^''\"]+)[''\"]')
+    # Find AppVersion anywhere in the update file instead of only at the start of a line.
+    # Some restricted-network/raw GitHub paths can return compressed-looking text where
+    # `$script:AppVersion is not at the beginning of its own line.
+    $match = [regex]::Match($ScriptText, '\$script:AppVersion\s*=\s*[''"]([^''"]+)[''"]')
 
     if (-not $match.Success) {
-        throw "The update file does not contain a valid `$script:AppVersion value near the top."
+        throw "The update file does not contain a valid `$script:AppVersion value."
     }
 
     return [string]$match.Groups[1].Value
@@ -1101,8 +1118,19 @@ function Get-RawUpdateInfo {
         "User-Agent" = "WarReportHelper/$script:AppVersion"
     }
 
-    $response = Invoke-WebRequest -Uri $updateUrl -Headers $headers -UseBasicParsing -TimeoutSec 30
-    $scriptText = [string]$response.Content
+    $webClient = New-Object System.Net.WebClient
+    foreach ($key in $headers.Keys) {
+        $webClient.Headers[$key] = [string]$headers[$key]
+    }
+
+    try {
+        $bytes = $webClient.DownloadData($updateUrl)
+        $scriptText = [System.Text.Encoding]::UTF8.GetString($bytes)
+    }
+    finally {
+        $webClient.Dispose()
+    }
+
     $latestVersion = Get-ScriptVersionFromText -ScriptText $scriptText
     $releaseNotes = Get-ReleaseNotesFromScriptText -ScriptText $scriptText
 
@@ -1181,6 +1209,7 @@ function Show-UpdatePromptWindow {
 "@
 
     $promptWindow = Read-Xaml $promptXaml
+    $promptWindow.FontFamily = [System.Windows.Media.FontFamily]::new([string]$script:S["AppFontFamily"])
     if ($null -ne $script:MainWindow) { $promptWindow.Owner = $script:MainWindow }
 
     $PromptRoot = $promptWindow.FindName("PromptRoot")
@@ -1334,15 +1363,38 @@ function Start-AppUpdate {
         $markerJson = $markerData | ConvertTo-Json -Depth 5
         $markerBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($markerJson))
 
+        $targetScriptB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($targetScript))
+        $downloadPathB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($downloadPath))
+        $backupPathB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($backupPath))
+        $completeFileB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($script:UpdateCompleteFile))
+
         $applyContent = @"
+`$ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 2
 try {
-    Copy-Item -Path '$targetScript' -Destination '$backupPath' -Force -ErrorAction SilentlyContinue
-    Copy-Item -Path '$downloadPath' -Destination '$targetScript' -Force -ErrorAction Stop
+    `$targetScript = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$targetScriptB64'))
+    `$downloadPath = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$downloadPathB64'))
+    `$backupPath = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$backupPathB64'))
+    `$completeFile = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$completeFileB64'))
+
+    for (`$i = 0; `$i -lt 20; `$i++) {
+        try {
+            `$stream = [System.IO.File]::Open(`$targetScript, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+            `$stream.Close()
+            break
+        }
+        catch {
+            Start-Sleep -Milliseconds 300
+        }
+    }
+
+    Copy-Item -Path `$targetScript -Destination `$backupPath -Force -ErrorAction SilentlyContinue
+    Copy-Item -Path `$downloadPath -Destination `$targetScript -Force -ErrorAction Stop
     `$markerJson = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$markerBase64'))
-    [System.IO.File]::WriteAllText('$script:UpdateCompleteFile', `$markerJson, [System.Text.Encoding]::UTF8)
-    Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-STA','-File','$targetScript','-ShowUpdateComplete')
+    [System.IO.File]::WriteAllText(`$completeFile, `$markerJson, [System.Text.Encoding]::UTF8)
+
+    Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-STA','-File',`$targetScript,'-ShowUpdateComplete')
 }
 catch {
     [System.Windows.Forms.MessageBox]::Show('The War Report Helper update failed: ' + `$_.Exception.Message, 'Update Failed') | Out-Null
@@ -1467,8 +1519,8 @@ $mainXaml = @"
             <Setter Property="Background" Value="Transparent"/>
             <Setter Property="BorderBrush" Value="Transparent"/>
             <Setter Property="BorderThickness" Value="0"/>
-            <Setter Property="FontFamily" Value="Segoe UI Symbol"/>
-            <Setter Property="FontSize" Value="18"/>
+            <Setter Property="FontFamily" Value="Segoe UI"/>
+            <Setter Property="FontSize" Value="15"/>
             <Setter Property="FontWeight" Value="Bold"/>
             <Setter Property="Padding" Value="0"/>
             <Setter Property="Cursor" Value="Hand"/>
@@ -1483,8 +1535,8 @@ $mainXaml = @"
                             SnapsToDevicePixels="True">
                             <Ellipse
                                 x:Name="HoverCircle"
-                                Width="31"
-                                Height="31"
+                                Width="30"
+                                Height="30"
                                 HorizontalAlignment="Center"
                                 VerticalAlignment="Center"
                                 Fill="Transparent"
@@ -1495,7 +1547,7 @@ $mainXaml = @"
                                 VerticalAlignment="Center"
                                 RecognizesAccessKey="True">
                                 <ContentPresenter.RenderTransform>
-                                    <TranslateTransform Y="-1"/>
+                                    <TranslateTransform Y="0"/>
                                 </ContentPresenter.RenderTransform>
                             </ContentPresenter>
                         </Grid>
@@ -1529,6 +1581,49 @@ $mainXaml = @"
             <Setter Property="FontWeight" Value="Bold"/>
             <Setter Property="Cursor" Value="Hand"/>
             <Setter Property="ToolTip" Value="Edit this task"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="{x:Type Button}">
+                        <Border
+                            Background="{TemplateBinding Background}"
+                            BorderBrush="{TemplateBinding BorderBrush}"
+                            BorderThickness="{TemplateBinding BorderThickness}"
+                            CornerRadius="7">
+                            <ContentPresenter
+                                HorizontalAlignment="Center"
+                                VerticalAlignment="Center"/>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding IsMouseOver, RelativeSource={RelativeSource AncestorType=ListBoxItem}}" Value="True">
+                    <Setter Property="Visibility" Value="Visible"/>
+                </DataTrigger>
+                <DataTrigger Binding="{Binding IsSelected, RelativeSource={RelativeSource AncestorType=ListBoxItem}}" Value="True">
+                    <Setter Property="Visibility" Value="Visible"/>
+                </DataTrigger>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Opacity" Value="0.85"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+
+
+
+        <Style x:Key="CounterTaskButtonStyle" TargetType="{x:Type Button}">
+            <Setter Property="Visibility" Value="Collapsed"/>
+            <Setter Property="Width" Value="28"/>
+            <Setter Property="Height" Value="26"/>
+            <Setter Property="Padding" Value="0"/>
+            <Setter Property="Margin" Value="6,0,0,0"/>
+            <Setter Property="Foreground" Value="{DynamicResource EditButtonTextBrush}"/>
+            <Setter Property="Background" Value="{DynamicResource EditButtonBackgroundBrush}"/>
+            <Setter Property="BorderBrush" Value="Black"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="FontWeight" Value="Bold"/>
+            <Setter Property="FontSize" Value="15"/>
+            <Setter Property="Cursor" Value="Hand"/>
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="{x:Type Button}">
@@ -1660,21 +1755,21 @@ $mainXaml = @"
                     HorizontalAlignment="Right">
                     <Button
                         x:Name="MinimizeWindowButton"
-                        Content="−"
+                        Content="-"
                         Width="46"
                         Height="34"
                         Style="{StaticResource TopBarButton}"
                         ToolTip="Minimize"/>
                     <Button
                         x:Name="MaximizeWindowButton"
-                        Content="▢"
+                        Content="[]"
                         Width="46"
                         Height="34"
                         Style="{StaticResource TopBarButton}"
                         ToolTip="Maximize or restore"/>
                     <Button
                         x:Name="CloseWindowButton"
-                        Content="×"
+                        Content="X"
                         Width="46"
                         Height="34"
                         Style="{StaticResource TopBarButton}"
@@ -1868,6 +1963,8 @@ $mainXaml = @"
                                     <ColumnDefinition Width="*"/>
                                     <ColumnDefinition Width="Auto"/>
                                     <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="Auto"/>
                                 </Grid.ColumnDefinitions>
 
                                 <TextBlock
@@ -1878,13 +1975,27 @@ $mainXaml = @"
 
                                 <Button
                                     Grid.Column="1"
+                                    Content="-"
+                                    Tag="DecreaseTaskCount"
+                                    ToolTip="Decrease this task count"
+                                    Style="{StaticResource CounterTaskButtonStyle}"/>
+
+                                <Button
+                                    Grid.Column="2"
+                                    Content="+"
+                                    Tag="IncreaseTaskCount"
+                                    ToolTip="Increase this task count"
+                                    Style="{StaticResource CounterTaskButtonStyle}"/>
+
+                                <Button
+                                    Grid.Column="3"
                                     Content="Edit"
                                     Tag="EditTask"
                                     Style="{StaticResource EditTaskButtonStyle}"/>
 
                                 <Button
-                                    Grid.Column="2"
-                                    Content="✕"
+                                    Grid.Column="4"
+                                    Content="X"
                                     Tag="DeleteTask"
                                     Style="{StaticResource DeleteTaskButtonStyle}"/>
                             </Grid>
@@ -2315,6 +2426,11 @@ function Apply-Settings {
     Register-ButtonPressAnimation $MaximizeWindowButton
     Register-ButtonPressAnimation $CloseWindowButton
 
+    if ([string]::IsNullOrWhiteSpace([string]$script:S["AppFontFamily"])) {
+        $script:S["AppFontFamily"] = "Nunito, Segoe UI"
+    }
+
+    $script:MainWindow.FontFamily = [System.Windows.Media.FontFamily]::new([string]$script:S["AppFontFamily"])
     $script:MainWindow.Background = New-Brush $script:S["WindowBackgroundColor"]
     $ShellGrid.Background = New-Brush $script:S["WindowBackgroundColor"]
     $CustomTitleBar.Background = New-Brush $script:S["WindowBorderColor"]
@@ -2428,9 +2544,7 @@ function Submit-Task {
     if ($newTask -ne "") {
         $newTask = $newTask -replace "(`r`n|`n|`r)+", " "
 
-        if (-not $newTask.StartsWith("•")) {
-            $newTask = "• $newTask"
-        }
+        $newTask = Normalize-TaskText $newTask
 
         [void]$TaskList.Items.Add($newTask)
         $TaskInput.Clear()
@@ -2480,12 +2594,95 @@ function Normalize-TaskText {
     param([string]$Text)
 
     $value = $Text.Trim() -replace "(`r`n|`n|`r)+", " "
+    $legacyBullet = [string][char]0x2022
 
-    if ($value -ne "" -and -not $value.StartsWith("•")) {
-        $value = "• $value"
+    if ($value.StartsWith($legacyBullet)) {
+        $value = $value.Substring(1).TrimStart()
+    }
+    elseif ($value.StartsWith("- ")) {
+        return $value
+    }
+    elseif ($value.StartsWith("-")) {
+        $value = $value.Substring(1).TrimStart()
+    }
+
+    if ($value -ne "") {
+        $value = "- $value"
     }
 
     return $value
+}
+
+
+function Get-TaskCountInfo {
+    param([string]$TaskText)
+
+    $text = [string]$TaskText
+    $count = 1
+    $baseText = $text.TrimEnd()
+
+    $match = [regex]::Match($baseText, '\s+\(x(\d+)\)\s*$')
+
+    if ($match.Success) {
+        $parsed = 1
+        if ([int]::TryParse($match.Groups[1].Value, [ref]$parsed)) {
+            $count = [Math]::Max(1, $parsed)
+            $baseText = $baseText.Substring(0, $match.Index).TrimEnd()
+        }
+    }
+
+    return [pscustomobject]@{
+        BaseText = $baseText
+        Count    = $count
+    }
+}
+
+function Set-TaskCountText {
+    param(
+        [string]$BaseText,
+        [int]$Count
+    )
+
+    $cleanBase = Normalize-TaskText $BaseText
+    $safeCount = [Math]::Max(1, [int]$Count)
+
+    if ($safeCount -le 1) {
+        return $cleanBase
+    }
+
+    return "$cleanBase (x$safeCount)"
+}
+
+function Change-TaskCounter {
+    param(
+        [int]$Index,
+        [int]$Delta
+    )
+
+    if ($Index -lt 0 -or $Index -ge $TaskList.Items.Count) {
+        return
+    }
+
+    $currentTask = [string]$TaskList.Items[$Index]
+    $info = Get-TaskCountInfo -TaskText $currentTask
+    $newCount = [Math]::Max(1, ([int]$info.Count + [int]$Delta))
+    $newText = Set-TaskCountText -BaseText $info.BaseText -Count $newCount
+
+    $TaskList.Items[$Index] = $newText
+
+    if ($script:IsViewingPreviousList) {
+        Mark-DisplayedListDirty
+    }
+
+    Save-Config
+    Update-TaskCount
+
+    if ($script:IsViewingPreviousList) {
+        Set-StatusMessage "Previous list task count updated to x$newCount. Changes are not saved to that file yet."
+    }
+    else {
+        Set-StatusMessage "Task count updated to x$newCount."
+    }
 }
 
 function Show-EditTaskWindow {
@@ -2559,6 +2756,7 @@ function Show-EditTaskWindow {
 
     $editWindow = Read-Xaml $editXaml
     $editWindow.Owner = $script:MainWindow
+    $editWindow.FontFamily = [System.Windows.Media.FontFamily]::new([string]$script:S["AppFontFamily"])
 
     $EditRoot = $editWindow.FindName("EditRoot")
     $EditLabel = $editWindow.FindName("EditLabel")
@@ -2583,10 +2781,14 @@ function Show-EditTaskWindow {
     }
 
     $cleanOriginal = [string]$OriginalTask
-    if ($cleanOriginal.StartsWith("• ")) {
+    $legacyBullet = [string][char]0x2022
+    if ($cleanOriginal.StartsWith("- ")) {
         $cleanOriginal = $cleanOriginal.Substring(2)
     }
-    elseif ($cleanOriginal.StartsWith("•")) {
+    elseif ($cleanOriginal.StartsWith("-")) {
+        $cleanOriginal = $cleanOriginal.Substring(1).Trim()
+    }
+    elseif ($cleanOriginal.StartsWith($legacyBullet)) {
         $cleanOriginal = $cleanOriginal.Substring(1).Trim()
     }
 
@@ -2754,7 +2956,7 @@ function Get-ThemeColorKeys {
 }
 
 function Get-ThemeFontKeys {
-    return @("TitleFontSize", "SubtitleFontSize", "SectionLabelFontSize", "ListFontSize", "InputFontSize")
+    return @("TitleFontSize", "SubtitleFontSize", "SectionLabelFontSize", "ListFontSize", "InputFontSize", "AppFontFamily")
 }
 
 function New-ThemeSettings {
@@ -3027,6 +3229,7 @@ function Open-SettingsWindow {
 
     $settingsWindow = Read-Xaml $settingsXaml
     $settingsWindow.Owner = $script:MainWindow
+    $settingsWindow.FontFamily = [System.Windows.Media.FontFamily]::new([string]$temp["AppFontFamily"])
     $settingsPanel = $settingsWindow.FindName("SettingsPanel")
 
     $temp = @{}
@@ -3350,6 +3553,7 @@ function Open-SettingsWindow {
 
     function Update-ThemePreview {
         if ($previewControls.Count -eq 0) { return }
+        if ($previewControls.ContainsKey("Root")) { $previewControls.Root.FontFamily = [System.Windows.Media.FontFamily]::new([string]$temp["AppFontFamily"]) }
 
         $previewControls.Root.Background = New-Brush $temp["WindowBackgroundColor"]
         $previewControls.Root.BorderBrush = New-Brush $temp["WindowBorderColor"]
@@ -3373,6 +3577,8 @@ function Open-SettingsWindow {
     }
 
     function Apply-SettingsWindowVisuals {
+        if ([string]::IsNullOrWhiteSpace([string]$temp["AppFontFamily"])) { $temp["AppFontFamily"] = "Nunito, Segoe UI" }
+        $settingsWindow.FontFamily = [System.Windows.Media.FontFamily]::new([string]$temp["AppFontFamily"])
         $settingsWindow.Background = New-Brush $temp["WindowBackgroundColor"]
         $settingsPanel.Background = New-Brush $temp["WindowBackgroundColor"]
 
@@ -3550,6 +3756,29 @@ function Open-SettingsWindow {
 
     Add-TwoColumnRow $appearance "Theme preset" $themeSelectorGrid
 
+    $fontCombo = New-Object System.Windows.Controls.ComboBox
+    [void]$comboBoxes.Add($fontCombo)
+    $fontCombo.Style = $settingsWindow.Resources["ModernComboBox"]
+    $fontCombo.Height = 32
+    $fontCombo.Margin = [System.Windows.Thickness]::new(4)
+    foreach ($fontName in $script:AvailableFontFamilies) {
+        [void]$fontCombo.Items.Add($fontName)
+    }
+    if ($fontCombo.Items.Contains([string]$temp["AppFontFamily"])) {
+        $fontCombo.SelectedItem = [string]$temp["AppFontFamily"]
+    }
+    else {
+        [void]$fontCombo.Items.Add([string]$temp["AppFontFamily"])
+        $fontCombo.SelectedItem = [string]$temp["AppFontFamily"]
+    }
+    $fontCombo.Add_SelectionChanged({
+        if ($null -ne $fontCombo.SelectedItem) {
+            $temp["AppFontFamily"] = [string]$fontCombo.SelectedItem
+            Apply-SettingsWindowVisuals
+        }
+    })
+    Add-TwoColumnRow $appearance "App font" $fontCombo
+
     Add-ActionColorRow $appearance "Accent Color" "AccentColor" "Accent"
     Add-ColorRow $appearance "WindowBackgroundColor" "Main Background"
     Add-ActionColorRow $appearance "Main Text Color" "TitleFontColor" "MainText"
@@ -3616,7 +3845,7 @@ function Open-SettingsWindow {
     $previewListBox.Child = $previewListStack
 
     $previewTaskText = New-Object System.Windows.Controls.TextBlock
-    $previewTaskText.Text = "• Example completed task"
+    $previewTaskText.Text = "- Example completed task"
     $previewTaskText.Margin = [System.Windows.Thickness]::new(0, 0, 0, 6)
     [void]$previewListStack.Children.Add($previewTaskText)
 
@@ -3631,7 +3860,7 @@ function Open-SettingsWindow {
         [void]$hoverGrid.ColumnDefinitions.Add($col)
     }
     $previewHoverText = New-Object System.Windows.Controls.TextBlock
-    $previewHoverText.Text = "• Hovered task"
+    $previewHoverText.Text = "- Hovered task"
     $previewHoverText.VerticalAlignment = "Center"
     [System.Windows.Controls.Grid]::SetColumn($previewHoverText, 0)
     [void]$hoverGrid.Children.Add($previewHoverText)
@@ -3643,7 +3872,7 @@ function Open-SettingsWindow {
     $previewEditButton.VerticalAlignment = "Center"
     [System.Windows.Controls.Grid]::SetColumn($previewEditButton, 1)
     [void]$hoverGrid.Children.Add($previewEditButton)
-    $previewDeleteButton = New-SettingsButton "✕"
+    $previewDeleteButton = New-SettingsButton "X"
     $previewDeleteButton.Width = 34
     $previewDeleteButton.Height = 30
     $previewDeleteButton.Padding = [System.Windows.Thickness]::new(0)
@@ -4237,7 +4466,15 @@ $TaskList.AddHandler(
             return
         }
 
-        if ([string]$button.Tag -eq "DeleteTask") {
+        if ([string]$button.Tag -eq "IncreaseTaskCount") {
+            Change-TaskCounter -Index $index -Delta 1
+            $e.Handled = $true
+        }
+        elseif ([string]$button.Tag -eq "DecreaseTaskCount") {
+            Change-TaskCounter -Index $index -Delta -1
+            $e.Handled = $true
+        }
+        elseif ([string]$button.Tag -eq "DeleteTask") {
             $removedTask = [string]$TaskList.Items[$index]
             $TaskList.Items.RemoveAt($index)
 
@@ -4259,10 +4496,11 @@ $TaskList.AddHandler(
         }
         elseif ([string]$button.Tag -eq "EditTask") {
             $originalTask = [string]$TaskList.Items[$index]
-            $editResult = Show-EditTaskWindow $originalTask
+            $taskInfo = Get-TaskCountInfo -TaskText $originalTask
+            $editResult = Show-EditTaskWindow $taskInfo.BaseText
 
             if ($editResult.Saved) {
-                $TaskList.Items[$index] = [string]$editResult.Text
+                $TaskList.Items[$index] = Set-TaskCountText -BaseText ([string]$editResult.Text) -Count ([int]$taskInfo.Count)
 
                 if ($script:IsViewingPreviousList) {
                     Mark-DisplayedListDirty
