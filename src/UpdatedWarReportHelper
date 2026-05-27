@@ -1,17 +1,18 @@
 # War Report Helper / Completed Tasks GUI
-# Version 3.2.4 - updater relaunch, safe button symbols, and font selector.
+# Version 3.2.5 - title button, font selector, and live preview polish.
 
 param(
     [switch]$ShowUpdateComplete
 )
 
-$script:AppVersion = "3.2.4"
+$script:AppVersion = "3.2.5"
 $script:AppFontFamily = "Nunito, Segoe UI"
 $script:AvailableFontFamilies = @(
     "Nunito, Segoe UI",
     "Segoe UI",
     "Aptos",
     "Calibri",
+    "Comic Sans MS",
     "Arial",
     "Verdana",
     "Tahoma",
@@ -20,10 +21,11 @@ $script:AvailableFontFamilies = @(
     "Consolas"
 )
 $script:AppReleaseNotes = @(
-    "Improved the raw updater so downloaded update text is decoded as UTF-8 and the app relaunches automatically after updating.",
-    "Replaced fragile symbol-based title bar and task buttons with ASCII/vector-safe controls to prevent strange character display after updates.",
-    "Added an included font selector in Settings so users can choose a more readable app font.",
-    "Kept task counters, weekly tracking, themes, dad joke display, and previous-list viewing intact."
+    "Changed the custom title bar maximize button to use a clearer square icon.",
+    "Improved the Settings font selector with a themed animated dropdown so font names stay readable across themes.",
+    "Added Comic Sans MS as an included font option.",
+    "Adjusted the live preview delete button spacing so it is no longer cut off.",
+    "Kept the raw updater workflow, task counters, weekly tracking, themes, dad joke display, and previous-list viewing intact."
 )
 
 # Relaunch in STA mode if needed
@@ -1762,7 +1764,7 @@ $mainXaml = @"
                         ToolTip="Minimize"/>
                     <Button
                         x:Name="MaximizeWindowButton"
-                        Content="[]"
+                        Content="☐"
                         Width="46"
                         Height="34"
                         Style="{StaticResource TopBarButton}"
@@ -3238,6 +3240,7 @@ function Open-SettingsWindow {
     }
 
     $builtInThemes = Get-BuiltInThemes
+    $fontSelectorPopupBorder = $null
     $settingsButtons = New-Object System.Collections.ArrayList
     $sizeBoxes = @{}
     $colorPreviews = New-Object System.Collections.ArrayList
@@ -3606,6 +3609,11 @@ function Open-SettingsWindow {
             $themeSelectorPopupBorder.BorderBrush = New-Brush $temp["WindowBorderColor"]
         }
 
+        if ($null -ne $fontSelectorPopupBorder) {
+            $fontSelectorPopupBorder.Background = New-Brush $temp["WindowBackgroundColor"]
+            $fontSelectorPopupBorder.BorderBrush = New-Brush $temp["WindowBorderColor"]
+        }
+
         foreach ($button in $settingsButtons) {
             $button.Foreground = New-Brush $temp["ButtonFontColor"]
             $button.Background = New-Brush $temp["ButtonBackgroundColor"]
@@ -3756,28 +3764,81 @@ function Open-SettingsWindow {
 
     Add-TwoColumnRow $appearance "Theme preset" $themeSelectorGrid
 
-    $fontCombo = New-Object System.Windows.Controls.ComboBox
-    [void]$comboBoxes.Add($fontCombo)
-    $fontCombo.Style = $settingsWindow.Resources["ModernComboBox"]
-    $fontCombo.Height = 32
-    $fontCombo.Margin = [System.Windows.Thickness]::new(4)
-    foreach ($fontName in $script:AvailableFontFamilies) {
-        [void]$fontCombo.Items.Add($fontName)
-    }
-    if ($fontCombo.Items.Contains([string]$temp["AppFontFamily"])) {
-        $fontCombo.SelectedItem = [string]$temp["AppFontFamily"]
-    }
-    else {
-        [void]$fontCombo.Items.Add([string]$temp["AppFontFamily"])
-        $fontCombo.SelectedItem = [string]$temp["AppFontFamily"]
-    }
-    $fontCombo.Add_SelectionChanged({
-        if ($null -ne $fontCombo.SelectedItem) {
-            $temp["AppFontFamily"] = [string]$fontCombo.SelectedItem
-            Apply-SettingsWindowVisuals
+    $fontSelectorGrid = New-Object System.Windows.Controls.Grid
+    $fontSelectorGrid.Margin = [System.Windows.Thickness]::new(0, 0, 0, 8)
+
+    $fontSelectorButton = New-SettingsButton "Font: $($temp["AppFontFamily"])"
+    $fontSelectorButton.Height = 38
+    $fontSelectorButton.HorizontalAlignment = "Stretch"
+    $fontSelectorButton.ToolTip = "Choose the app font"
+    [void]$fontSelectorGrid.Children.Add($fontSelectorButton)
+
+    $fontSelectorPopup = New-Object System.Windows.Controls.Primitives.Popup
+    $fontSelectorPopup.PlacementTarget = $fontSelectorButton
+    $fontSelectorPopup.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Bottom
+    $fontSelectorPopup.AllowsTransparency = $true
+    $fontSelectorPopup.StaysOpen = $false
+    $fontSelectorPopup.PopupAnimation = [System.Windows.Controls.Primitives.PopupAnimation]::Slide
+
+    $fontSelectorPopupBorder = New-Object System.Windows.Controls.Border
+    $fontSelectorPopupBorder.Width = 245
+    $fontSelectorPopupBorder.MaxHeight = 260
+    $fontSelectorPopupBorder.BorderThickness = [System.Windows.Thickness]::new(1)
+    $fontSelectorPopupBorder.CornerRadius = [System.Windows.CornerRadius]::new(12)
+    $fontSelectorPopupBorder.Padding = [System.Windows.Thickness]::new(8)
+    $fontSelectorPopupBorder.Margin = [System.Windows.Thickness]::new(0, 6, 0, 0)
+
+    $fontSelectorScroll = New-Object System.Windows.Controls.ScrollViewer
+    $fontSelectorScroll.VerticalScrollBarVisibility = [System.Windows.Controls.ScrollBarVisibility]::Auto
+    $fontSelectorList = New-Object System.Windows.Controls.StackPanel
+    $fontSelectorScroll.Content = $fontSelectorList
+    $fontSelectorPopupBorder.Child = $fontSelectorScroll
+    $fontSelectorPopup.Child = $fontSelectorPopupBorder
+    [void]$fontSelectorGrid.Children.Add($fontSelectorPopup)
+
+    function Add-FontSelectorOption {
+        param([string]$FontName)
+
+        $fontOptionButton = New-SettingsButton $FontName
+        $fontOptionButton.Height = 34
+        $fontOptionButton.HorizontalAlignment = "Stretch"
+        $fontOptionButton.Margin = [System.Windows.Thickness]::new(0, 0, 0, 6)
+        $fontOptionButton.Tag = $FontName
+
+        try {
+            $fontOptionButton.FontFamily = [System.Windows.Media.FontFamily]::new($FontName)
         }
+        catch {}
+
+        $fontOptionButton.Add_Click({
+            $selectedFont = [string]$this.Tag
+            if (-not [string]::IsNullOrWhiteSpace($selectedFont)) {
+                $temp["AppFontFamily"] = $selectedFont
+                $fontSelectorButton.Content = "Font: $selectedFont"
+                Apply-SettingsWindowVisuals
+                Set-StatusMessage "Previewing font: $selectedFont"
+            }
+            $fontSelectorPopup.IsOpen = $false
+        })
+
+        [void]$fontSelectorList.Children.Add($fontOptionButton)
+    }
+
+    foreach ($fontName in $script:AvailableFontFamilies) {
+        Add-FontSelectorOption -FontName $fontName
+    }
+
+    if (-not ($script:AvailableFontFamilies -contains [string]$temp["AppFontFamily"])) {
+        Add-FontSelectorOption -FontName ([string]$temp["AppFontFamily"])
+    }
+
+    $fontSelectorButton.Add_Click({
+        Apply-SettingsWindowVisuals
+        $fontSelectorPopup.PlacementTarget = $fontSelectorButton
+        $fontSelectorPopup.IsOpen = -not $fontSelectorPopup.IsOpen
     })
-    Add-TwoColumnRow $appearance "App font" $fontCombo
+
+    Add-TwoColumnRow $appearance "App font" $fontSelectorGrid
 
     Add-ActionColorRow $appearance "Accent Color" "AccentColor" "Accent"
     Add-ColorRow $appearance "WindowBackgroundColor" "Main Background"
@@ -3854,7 +3915,7 @@ function Open-SettingsWindow {
     $previewHoverRow.Padding = [System.Windows.Thickness]::new(8, 5, 8, 5)
     $hoverGrid = New-Object System.Windows.Controls.Grid
     $previewHoverRow.Child = $hoverGrid
-    foreach ($width in @("*", "64", "42")) {
+    foreach ($width in @("*", "68", "50")) {
         $col = New-Object System.Windows.Controls.ColumnDefinition
         if ($width -eq "*") { $col.Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star) } else { $col.Width = [System.Windows.GridLength]::new([double]$width) }
         [void]$hoverGrid.ColumnDefinitions.Add($col)
@@ -3865,7 +3926,7 @@ function Open-SettingsWindow {
     [System.Windows.Controls.Grid]::SetColumn($previewHoverText, 0)
     [void]$hoverGrid.Children.Add($previewHoverText)
     $previewEditButton = New-SettingsButton "Edit"
-    $previewEditButton.Width = 56
+    $previewEditButton.Width = 60
     $previewEditButton.Height = 30
     $previewEditButton.Padding = [System.Windows.Thickness]::new(0)
     $previewEditButton.Margin = [System.Windows.Thickness]::new(6, 0, 4, 0)
@@ -3873,10 +3934,10 @@ function Open-SettingsWindow {
     [System.Windows.Controls.Grid]::SetColumn($previewEditButton, 1)
     [void]$hoverGrid.Children.Add($previewEditButton)
     $previewDeleteButton = New-SettingsButton "X"
-    $previewDeleteButton.Width = 34
+    $previewDeleteButton.Width = 42
     $previewDeleteButton.Height = 30
     $previewDeleteButton.Padding = [System.Windows.Thickness]::new(0)
-    $previewDeleteButton.Margin = [System.Windows.Thickness]::new(4, 0, 0, 0)
+    $previewDeleteButton.Margin = [System.Windows.Thickness]::new(4, 0, 2, 0)
     $previewDeleteButton.VerticalAlignment = "Center"
     [System.Windows.Controls.Grid]::SetColumn($previewDeleteButton, 2)
     [void]$hoverGrid.Children.Add($previewDeleteButton)
