@@ -1,4 +1,4 @@
-# Quick legacy updater for War Report Helper
+﻿# Quick legacy updater for War Report Helper
 # This replaces the installed WarReportHelper.ps1 with the latest raw GitHub version.
 
 $ErrorActionPreference = "Stop"
