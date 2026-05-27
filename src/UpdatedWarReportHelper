@@ -1,11 +1,11 @@
 # War Report Helper / Completed Tasks GUI
-# Version 3.2.7 - GitHub raw dad joke list.
+# Version 3.2.8 - Structured dad joke file parsing.
 
 param(
     [switch]$ShowUpdateComplete
 )
 
-$script:AppVersion = "3.2.7"
+$script:AppVersion = "3.2.8"
 $script:AppFontFamily = "Nunito, Segoe UI"
 $script:AvailableFontFamilies = @(
     "Nunito, Segoe UI",
@@ -21,11 +21,10 @@ $script:AvailableFontFamilies = @(
     "Consolas"
 )
 $script:AppReleaseNotes = @(
-    "Changed dad joke loading to use the GitHub raw jokes file instead of calling the Dad Joke API from every client.",
-    "Added a DadJokesRawUrl setting pointed to the LSmaroff/WarReportHelper jokes/dadjokes raw file.",
-    "Added UTF-8/raw-text joke parsing that randomly selects a joke from the downloaded list and falls back safely when offline.",
-    "Clarified updater targeting so updates replace the installed script under the current user Documents\War Report Helper folder when present.",
-    "Kept update detection, task counters, weekly tracking, themes, font selection, and previous-list viewing intact."
+    "Changed the dad joke file format to structured JSON so multi-line jokes stay grouped as one joke.",
+    "Updated dad joke parsing to support the new jokes/dadjokes JSON format and preserve compatibility with the old line-based file.",
+    "Normalized downloaded jokes for display so embedded line breaks do not split a single joke into multiple separate jokes.",
+    "Added an updated dad joke builder script that exports GitHub-ready JSON."
 )
 
 # Relaunch in STA mode if needed
@@ -2897,42 +2896,77 @@ function Select-DadJokeFromRawText {
 
     $jokes = New-Object System.Collections.ArrayList
 
+    function Add-DadJokeCandidate {
+        param([object]$Candidate)
+
+        if ($null -eq $Candidate) {
+            return
+        }
+
+        $candidateText = [string]$Candidate
+        $candidateText = $candidateText -replace "`r`n", " "
+        $candidateText = $candidateText -replace "`n", " "
+        $candidateText = $candidateText -replace "`r", " "
+        $candidateText = [regex]::Replace($candidateText, "\s+", " ").Trim()
+
+        if (-not [string]::IsNullOrWhiteSpace($candidateText)) {
+            [void]$jokes.Add($candidateText)
+        }
+    }
+
     if ([string]::IsNullOrWhiteSpace($RawText)) {
         return $script:DadJokeFallback
     }
 
     try {
         $trimmed = $RawText.Trim()
+        $trimmed = $trimmed.Trim([char]0xFEFF)
 
-        if ($trimmed.StartsWith("[")) {
-            $jsonItems = $trimmed | ConvertFrom-Json
+        if ($trimmed.StartsWith("{") -or $trimmed.StartsWith("[")) {
+            $jsonRoot = $trimmed | ConvertFrom-Json -Depth 12
+            $items = @()
 
-            foreach ($item in @($jsonItems)) {
-                $candidate = ""
+            if ($jsonRoot -is [System.Array]) {
+                $items = @($jsonRoot)
+            }
+            elseif ($null -ne $jsonRoot.jokes) {
+                $items = @($jsonRoot.jokes)
+            }
+            elseif ($null -ne $jsonRoot.items) {
+                $items = @($jsonRoot.items)
+            }
+            else {
+                $items = @($jsonRoot)
+            }
 
+            foreach ($item in $items) {
                 if ($item -is [string]) {
-                    $candidate = [string]$item
+                    Add-DadJokeCandidate $item
                 }
                 elseif ($null -ne $item.joke) {
-                    $candidate = [string]$item.joke
+                    Add-DadJokeCandidate $item.joke
                 }
-
-                $candidate = $candidate.Trim()
-
-                if (-not [string]::IsNullOrWhiteSpace($candidate)) {
-                    [void]$jokes.Add($candidate)
+                elseif ($null -ne $item.text) {
+                    Add-DadJokeCandidate $item.text
+                }
+                elseif ($null -ne $item.value) {
+                    Add-DadJokeCandidate $item.value
                 }
             }
         }
+        elseif ($trimmed -match "(?m)^\s*---JOKE---\s*$") {
+            $blocks = $trimmed -split "(?m)^\s*---JOKE---\s*$"
+
+            foreach ($block in $blocks) {
+                Add-DadJokeCandidate $block
+            }
+        }
         else {
+            # Legacy fallback: one joke per line.
             $lines = $RawText -split "`r?`n"
 
             foreach ($line in $lines) {
-                $candidate = ([string]$line).Trim()
-
-                if (-not [string]::IsNullOrWhiteSpace($candidate)) {
-                    [void]$jokes.Add($candidate)
-                }
+                Add-DadJokeCandidate $line
             }
         }
     }
