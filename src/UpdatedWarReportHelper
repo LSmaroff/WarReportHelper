@@ -1,7 +1,18 @@
-# War Report Helper / Completed Tasks GUI - Themed UI Refresh
-# Adds a custom animated theme preset selector, reliable live preview tooltips, fixed preview action buttons, themed custom title bar, and clearer text rendering.
+# War Report Helper / Completed Tasks GUI
+# Version 3.2.1 - Raw GitHub update workflow and updater cleanup.
 
-$script:AppVersion = "3.1.0"
+param(
+    [switch]$ShowUpdateComplete
+)
+
+$script:AppVersion = "3.2.1"
+$script:AppReleaseNotes = @(
+    "Reworked updates to use the raw GitHub UpdatedWarReportHelper file instead of direct PS1 release downloads.",
+    "Added startup update prompt with Later and Update Now choices.",
+    "Added safe script replacement with backup and automatic relaunch after updating.",
+    "Added update completion popup showing the version installed and change details.",
+    "Preserved weekly task tracking, previous-list viewing, themes, dynamic task sizing, and dad joke display."
+)
 
 # Relaunch in STA mode if needed
 if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne [System.Threading.ApartmentState]::STA) {
@@ -63,6 +74,7 @@ else {
 }
 
 $script:ConfigFile = Join-Path $script:ScriptDirectory "CompletedTasksGUI_Config.txt"
+$script:UpdateCompleteFile = Join-Path $script:ScriptDirectory "WarReportHelper_UpdateComplete.json"
 
 # -----------------------------
 # Defaults / Settings
@@ -109,8 +121,7 @@ $script:DefaultSettings = [ordered]@{
     AutoSaveEnabled             = $true
     AutoSaveIntervalMinutes     = 60
 
-    UpdateRepoOwner             = "LSmaroff"
-    UpdateRepoName              = "WarReportHelper"
+    UpdateRawUrl                = "https://raw.githubusercontent.com/LSmaroff/WarReportHelper/refs/heads/main/src/UpdatedWarReportHelper"
     CheckForUpdatesOnStartup    = $true
     LastWorkWeekMonday          = ""
 
@@ -1031,75 +1042,226 @@ function Compare-VersionString {
     }
 }
 
-function Get-GitHubLatestReleaseInfo {
-    $owner = [string]$script:S["UpdateRepoOwner"]
-    $repo = [string]$script:S["UpdateRepoName"]
+function Get-ScriptVersionFromText {
+    param([string]$ScriptText)
 
-    if ([string]::IsNullOrWhiteSpace($owner) -or [string]::IsNullOrWhiteSpace($repo)) {
-        throw "GitHub update repository owner or name is blank."
+    if ([string]::IsNullOrWhiteSpace($ScriptText)) {
+        throw "The update file was empty."
+    }
+
+    $match = [regex]::Match($ScriptText, '(?m)^\s*\$script:AppVersion\s*=\s*[''\"]([^''\"]+)[''\"]')
+
+    if (-not $match.Success) {
+        throw "The update file does not contain a valid `$script:AppVersion value near the top."
+    }
+
+    return [string]$match.Groups[1].Value
+}
+
+function Get-ReleaseNotesFromScriptText {
+    param([string]$ScriptText)
+
+    $notes = New-Object System.Collections.ArrayList
+
+    try {
+        $blockMatch = [regex]::Match($ScriptText, '(?s)\$script:AppReleaseNotes\s*=\s*@\((.*?)\)')
+
+        if ($blockMatch.Success) {
+            $body = $blockMatch.Groups[1].Value
+            $stringMatches = [regex]::Matches($body, '[''\"]([^''\"]+)[''\"]')
+
+            foreach ($match in $stringMatches) {
+                $note = [string]$match.Groups[1].Value
+                if (-not [string]::IsNullOrWhiteSpace($note)) {
+                    [void]$notes.Add($note)
+                }
+            }
+        }
+    }
+    catch {}
+
+    if ($notes.Count -eq 0) {
+        [void]$notes.Add("Updated War Report Helper to a newer version.")
+    }
+
+    return @($notes)
+}
+
+function Get-RawUpdateInfo {
+    $updateUrl = [string]$script:S["UpdateRawUrl"]
+
+    if ([string]::IsNullOrWhiteSpace($updateUrl)) {
+        throw "The raw GitHub update URL is blank."
     }
 
     try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {}
 
-    $apiUrl = "https://api.github.com/repos/$owner/$repo/releases/latest"
     $headers = @{
-        "Accept" = "application/vnd.github+json"
+        "Accept" = "text/plain"
         "User-Agent" = "WarReportHelper/$script:AppVersion"
     }
 
-    $release = Invoke-RestMethod -Uri $apiUrl -Headers $headers -Method Get -TimeoutSec 20
-
-    $scriptAsset = $release.assets | Where-Object { $_.name -eq "WarReportHelper.ps1" } | Select-Object -First 1
-    $jsonAsset = $release.assets | Where-Object { $_.name -eq "WarReportHelper_Version.json" } | Select-Object -First 1
-
-    if ($null -eq $scriptAsset) {
-        throw "The latest release does not include WarReportHelper.ps1."
-    }
-
-    $versionInfo = $null
-    if ($null -ne $jsonAsset) {
-        $versionInfo = Invoke-RestMethod -Uri $jsonAsset.browser_download_url -Headers @{ "User-Agent" = "WarReportHelper/$script:AppVersion" } -Method Get -TimeoutSec 20
-    }
-
-    $latestVersion = $release.tag_name -replace '^v', ''
-    if ($null -ne $versionInfo -and $versionInfo.version) {
-        $latestVersion = [string]$versionInfo.version
-    }
+    $response = Invoke-WebRequest -Uri $updateUrl -Headers $headers -UseBasicParsing -TimeoutSec 30
+    $scriptText = [string]$response.Content
+    $latestVersion = Get-ScriptVersionFromText -ScriptText $scriptText
+    $releaseNotes = Get-ReleaseNotesFromScriptText -ScriptText $scriptText
 
     return [pscustomobject]@{
-        Release = $release
-        VersionInfo = $versionInfo
         LatestVersion = $latestVersion
-        ScriptUrl = [string]$scriptAsset.browser_download_url
-        ScriptAsset = $scriptAsset
-        JsonAsset = $jsonAsset
+        ScriptText    = $scriptText
+        ReleaseNotes  = @($releaseNotes)
+        UpdateUrl     = $updateUrl
     }
+}
+
+function Format-ReleaseNotesText {
+    param([object[]]$ReleaseNotes)
+
+    if ($null -eq $ReleaseNotes -or $ReleaseNotes.Count -eq 0) {
+        return "- Updated War Report Helper."
+    }
+
+    return (($ReleaseNotes | ForEach-Object { "- $_" }) -join "`n")
+}
+
+function Show-UpdatePromptWindow {
+    param(
+        [string]$LatestVersion,
+        [object[]]$ReleaseNotes
+    )
+
+    $notesText = Format-ReleaseNotesText -ReleaseNotes $ReleaseNotes
+
+    $promptXaml = @"
+<Window
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="War Report Helper Update"
+    Width="520"
+    Height="330"
+    MinWidth="480"
+    MinHeight="300"
+    WindowStartupLocation="CenterOwner"
+    ResizeMode="NoResize"
+    FontFamily="Segoe UI"
+    Background="#FFF5F7FB">
+
+    <Border x:Name="PromptRoot" Padding="18" Background="#FFF5F7FB">
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+
+            <StackPanel Grid.Row="0">
+                <TextBlock x:Name="PromptTitle" Text="Update available" FontSize="20" FontWeight="Bold" Margin="0,0,0,6"/>
+                <TextBlock x:Name="PromptSubtitle" Text="A newer version of War Report Helper is available." TextWrapping="Wrap"/>
+            </StackPanel>
+
+            <Border Grid.Row="1" x:Name="NotesBorder" Margin="0,14,0,14" Padding="12" CornerRadius="10" BorderThickness="1">
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <TextBlock x:Name="NotesTextBlock" TextWrapping="Wrap"/>
+                </ScrollViewer>
+            </Border>
+
+            <Grid Grid.Row="2">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="120"/>
+                    <ColumnDefinition Width="120"/>
+                </Grid.ColumnDefinitions>
+
+                <Button x:Name="LaterButton" Grid.Column="1" Content="Later" Height="38" Margin="0,0,8,0"/>
+                <Button x:Name="UpdateNowButton" Grid.Column="2" Content="Update Now" Height="38"/>
+            </Grid>
+        </Grid>
+    </Border>
+</Window>
+"@
+
+    $promptWindow = Read-Xaml $promptXaml
+    if ($null -ne $script:MainWindow) { $promptWindow.Owner = $script:MainWindow }
+
+    $PromptRoot = $promptWindow.FindName("PromptRoot")
+    $PromptTitle = $promptWindow.FindName("PromptTitle")
+    $PromptSubtitle = $promptWindow.FindName("PromptSubtitle")
+    $NotesBorder = $promptWindow.FindName("NotesBorder")
+    $NotesTextBlock = $promptWindow.FindName("NotesTextBlock")
+    $LaterButton = $promptWindow.FindName("LaterButton")
+    $UpdateNowButton = $promptWindow.FindName("UpdateNowButton")
+
+    $promptWindow.Background = New-Brush $script:S["WindowBackgroundColor"]
+    $PromptRoot.Background = New-Brush $script:S["WindowBackgroundColor"]
+    $PromptTitle.Foreground = New-Brush $script:S["TitleFontColor"]
+    $PromptSubtitle.Foreground = New-Brush $script:S["SubtitleFontColor"]
+    $NotesBorder.Background = New-Brush $script:S["ListBackgroundColor"]
+    $NotesBorder.BorderBrush = New-Brush $script:S["WindowBorderColor"]
+    $NotesTextBlock.Foreground = New-Brush $script:S["ListFontColor"]
+    $NotesTextBlock.Text = "Current version: v$script:AppVersion`nNew version: v$LatestVersion`n`nChanges:`n$notesText"
+
+    foreach ($button in @($LaterButton, $UpdateNowButton)) {
+        $button.Foreground = New-Brush $script:S["ButtonFontColor"]
+        $button.Background = New-Brush $script:S["ButtonBackgroundColor"]
+        $button.BorderBrush = New-Brush "#FF000000"
+        $button.BorderThickness = [System.Windows.Thickness]::new(1)
+        $button.FontWeight = [System.Windows.FontWeights]::SemiBold
+    }
+
+    $choice = @{ Value = "Later" }
+
+    $LaterButton.Add_Click({
+        $choice.Value = "Later"
+        $promptWindow.Close()
+    })
+
+    $UpdateNowButton.Add_Click({
+        $choice.Value = "UpdateNow"
+        $promptWindow.Close()
+    })
+
+    [void]$promptWindow.ShowDialog()
+    return [string]$choice.Value
+}
+
+function Write-UpdateTextToTempFile {
+    param([string]$ScriptText)
+
+    $tempFolder = Join-Path ([System.IO.Path]::GetTempPath()) "WarReportHelper_Update"
+    if (-not (Test-Path $tempFolder)) {
+        [void](New-Item -ItemType Directory -Path $tempFolder -Force)
+    }
+
+    $downloadPath = Join-Path $tempFolder "WarReportHelper_New.ps1"
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($downloadPath, $ScriptText, $utf8NoBom)
+
+    return $downloadPath
 }
 
 function Check-ForUpdates {
     param(
         [switch]$Interactive,
-        [switch]$Silent
+        [switch]$Silent,
+        [switch]$Startup
     )
 
     try {
-        $info = Get-GitHubLatestReleaseInfo
+        $info = Get-RawUpdateInfo
         $comparison = Compare-VersionString $info.LatestVersion $script:AppVersion
 
         if ($comparison -gt 0) {
             $message = "Update available: v$($info.LatestVersion). Current version: v$script:AppVersion."
             Set-StatusMessage $message
 
-            if ($Interactive) {
-                $result = [System.Windows.MessageBox]::Show(
-                    "$message`n`nDo you want to update now?",
-                    "War Report Helper Update Available",
-                    [System.Windows.MessageBoxButton]::YesNo,
-                    [System.Windows.MessageBoxImage]::Question
-                )
+            if ($Interactive -or $Startup) {
+                $choice = Show-UpdatePromptWindow -LatestVersion $info.LatestVersion -ReleaseNotes $info.ReleaseNotes
 
-                if ($result -eq [System.Windows.MessageBoxResult]::Yes) {
-                    Start-AppUpdate
+                if ($choice -eq "UpdateNow") {
+                    Start-AppUpdate -UpdateInfo $info
+                }
+                else {
+                    Set-StatusMessage "Update postponed until next launch."
                 }
             }
 
@@ -1109,7 +1271,7 @@ function Check-ForUpdates {
         if ($Interactive) {
             Show-AppMessage -Message "You are already on the latest version: v$script:AppVersion" -Title "No Update Available" -Image ([System.Windows.MessageBoxImage]::Information)
         }
-        elseif (-not $Silent) {
+        elseif (-not $Silent -and -not $Startup) {
             Set-StatusMessage "No update available. Current version: v$script:AppVersion."
         }
 
@@ -1119,7 +1281,7 @@ function Check-ForUpdates {
         if ($Interactive) {
             Show-AppMessage -Message "Unable to check for updates.`n$($_.Exception.Message)" -Title "Update Check Failed" -Image ([System.Windows.MessageBoxImage]::Warning)
         }
-        elseif (-not $Silent) {
+        elseif (-not $Silent -and -not $Startup) {
             Set-StatusMessage "Update check failed."
         }
 
@@ -1128,34 +1290,18 @@ function Check-ForUpdates {
 }
 
 function Start-AppUpdate {
+    param([object]$UpdateInfo)
+
     try {
-        $info = Get-GitHubLatestReleaseInfo
-        $comparison = Compare-VersionString $info.LatestVersion $script:AppVersion
+        if ($null -eq $UpdateInfo) {
+            $UpdateInfo = Get-RawUpdateInfo
+        }
+
+        $comparison = Compare-VersionString $UpdateInfo.LatestVersion $script:AppVersion
 
         if ($comparison -le 0) {
-            $result = [System.Windows.MessageBox]::Show(
-                "The latest release appears to be v$($info.LatestVersion), and you are running v$script:AppVersion.`n`nDo you want to reinstall the latest release anyway?",
-                "Reinstall Latest Release?",
-                [System.Windows.MessageBoxButton]::YesNo,
-                [System.Windows.MessageBoxImage]::Question
-            )
-
-            if ($result -ne [System.Windows.MessageBoxResult]::Yes) { return }
-        }
-        else {
-            $notes = ""
-            if ($null -ne $info.VersionInfo -and $info.VersionInfo.releaseNotes) {
-                $notes = "`n`nRelease notes:`n" + (($info.VersionInfo.releaseNotes | ForEach-Object { "- $_" }) -join "`n")
-            }
-
-            $result = [System.Windows.MessageBox]::Show(
-                "Install War Report Helper v$($info.LatestVersion)?$notes",
-                "Install Update",
-                [System.Windows.MessageBoxButton]::YesNo,
-                [System.Windows.MessageBoxImage]::Question
-            )
-
-            if ($result -ne [System.Windows.MessageBoxResult]::Yes) { return }
+            Show-AppMessage -Message "No newer update was found. Current version: v$script:AppVersion. Latest scanned version: v$($UpdateInfo.LatestVersion)." -Title "No Update Available" -Image ([System.Windows.MessageBoxImage]::Information)
+            return
         }
 
         $targetScript = $PSCommandPath
@@ -1163,27 +1309,30 @@ function Start-AppUpdate {
             $targetScript = Join-Path $script:ScriptDirectory "WarReportHelper.ps1"
         }
 
-        $tempFolder = Join-Path ([System.IO.Path]::GetTempPath()) "WarReportHelper_Update"
-        if (-not (Test-Path $tempFolder)) { [void](New-Item -ItemType Directory -Path $tempFolder -Force) }
+        $downloadPath = Write-UpdateTextToTempFile -ScriptText $UpdateInfo.ScriptText
 
-        $downloadPath = Join-Path $tempFolder "WarReportHelper_New.ps1"
-        Invoke-WebRequest -Uri $info.ScriptUrl -OutFile $downloadPath -Headers @{ "User-Agent" = "WarReportHelper/$script:AppVersion" } -UseBasicParsing -TimeoutSec 60
-
-        if ($null -ne $info.VersionInfo -and $info.VersionInfo.sha256) {
-            $expectedHash = ([string]$info.VersionInfo.sha256).ToUpperInvariant()
-            $actualHash = (Get-FileHash -Path $downloadPath -Algorithm SHA256).Hash.ToUpperInvariant()
-
-            if ($expectedHash -ne $actualHash) {
-                throw "The downloaded update failed SHA256 verification. Expected $expectedHash but got $actualHash."
-            }
+        $parsedVersion = Get-ScriptVersionFromText -ScriptText ([System.IO.File]::ReadAllText($downloadPath))
+        if ((Compare-VersionString $parsedVersion $script:AppVersion) -le 0) {
+            throw "Downloaded update version v$parsedVersion is not newer than the installed version v$script:AppVersion."
         }
 
         $backupFolder = Join-Path $script:ScriptDirectory "Backups"
-        if (-not (Test-Path $backupFolder)) { [void](New-Item -ItemType Directory -Path $backupFolder -Force) }
+        if (-not (Test-Path $backupFolder)) {
+            [void](New-Item -ItemType Directory -Path $backupFolder -Force)
+        }
 
-        $applyScript = Join-Path $tempFolder "Apply_WarReportHelper_Update.ps1"
+        $tempFolder = Split-Path -Parent $downloadPath
+        $applyScript = Join-Path $tempFolder "Apply_WarReportHelper_RawUpdate.ps1"
         $backupName = "WarReportHelper_Backup_$(Get-Date -Format 'MM-dd-yyyy_HH-mm-ss').ps1"
         $backupPath = Join-Path $backupFolder $backupName
+
+        $markerData = [ordered]@{
+            FromVersion = $script:AppVersion
+            ToVersion = [string]$UpdateInfo.LatestVersion
+            ReleaseNotes = @($UpdateInfo.ReleaseNotes)
+        }
+        $markerJson = $markerData | ConvertTo-Json -Depth 5
+        $markerBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($markerJson))
 
         $applyContent = @"
 Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
@@ -1191,7 +1340,9 @@ Start-Sleep -Seconds 2
 try {
     Copy-Item -Path '$targetScript' -Destination '$backupPath' -Force -ErrorAction SilentlyContinue
     Copy-Item -Path '$downloadPath' -Destination '$targetScript' -Force -ErrorAction Stop
-    Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-STA','-File','$targetScript')
+    `$markerJson = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$markerBase64'))
+    [System.IO.File]::WriteAllText('$script:UpdateCompleteFile', `$markerJson, [System.Text.Encoding]::UTF8)
+    Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-STA','-File','$targetScript','-ShowUpdateComplete')
 }
 catch {
     [System.Windows.Forms.MessageBox]::Show('The War Report Helper update failed: ' + `$_.Exception.Message, 'Update Failed') | Out-Null
@@ -1200,13 +1351,31 @@ catch {
 
         $applyContent | Set-Content -Path $applyScript -Encoding UTF8
 
-        Set-StatusMessage "Applying update to v$($info.LatestVersion)..."
+        Set-StatusMessage "Applying update to v$($UpdateInfo.LatestVersion)..."
         Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File', $applyScript)
         $script:MainWindow.Close()
     }
     catch {
         Show-AppMessage -Message "The update could not be installed.`n$($_.Exception.Message)" -Title "Update Failed" -Image ([System.Windows.MessageBoxImage]::Error)
     }
+}
+
+function Show-UpdateCompleteNotice {
+    try {
+        if (-not (Test-Path $script:UpdateCompleteFile)) { return }
+
+        $data = Get-Content $script:UpdateCompleteFile -Raw | ConvertFrom-Json
+        Remove-Item $script:UpdateCompleteFile -Force -ErrorAction SilentlyContinue
+
+        $notes = @($data.ReleaseNotes)
+        if ($notes.Count -eq 0) { $notes = @("Updated War Report Helper.") }
+
+        $notesText = Format-ReleaseNotesText -ReleaseNotes $notes
+        $message = "War Report Helper updated successfully.`n`nPrevious version: v$($data.FromVersion)`nCurrent version: v$($data.ToVersion)`n`nChanges:`n$notesText"
+
+        Show-AppMessage -Message $message -Title "Update Complete" -Image ([System.Windows.MessageBoxImage]::Information)
+    }
+    catch {}
 }
 
 function Start-StartupUpdateCheck {
@@ -1217,7 +1386,7 @@ function Start-StartupUpdateCheck {
         $timer.Interval = [TimeSpan]::FromSeconds(5)
         $timer.Add_Tick({
             $this.Stop()
-            Check-ForUpdates -Silent | Out-Null
+            Check-ForUpdates -Startup -Silent | Out-Null
         })
         $timer.Start()
     }
@@ -1648,7 +1817,7 @@ $mainXaml = @"
                                 Height="38"
                                 Margin="0,0,0,8"
                                 Style="{StaticResource ModernButton}"
-                                ToolTip="Check GitHub Releases for a newer version"/>
+                                ToolTip="Check the configured raw GitHub update file for a newer version"/>
 
                             <Button
                                 x:Name="HelpPopupButton"
@@ -2242,7 +2411,7 @@ function Apply-Settings {
     $OpenSettingsPopupButton.ToolTip = "Open customization and export settings"
     $SaveListPopupButton.ToolTip = "Choose where to save a copy of the task list"
     $OpenPreviousListPopupButton.ToolTip = "Open a previously saved task list without replacing today's tasks"
-    $CheckUpdatesPopupButton.ToolTip = "Check GitHub Releases for a newer version"
+    $CheckUpdatesPopupButton.ToolTip = "Check the configured raw GitHub update file for a newer version"
     $HelpPopupButton.ToolTip = "Show how to use this app"
 
     Apply-ListVisibility
@@ -3755,11 +3924,8 @@ function Open-SettingsWindow {
     $currentVersionLabel.Margin = [System.Windows.Thickness]::new(0, 0, 0, 8)
     [void]$updates.Children.Add($currentVersionLabel)
 
-    $updateRepoOwnerBox = New-SettingsTextBox ([string]$temp["UpdateRepoOwner"])
-    Add-TwoColumnRow $updates "GitHub owner" $updateRepoOwnerBox
-
-    $updateRepoNameBox = New-SettingsTextBox ([string]$temp["UpdateRepoName"])
-    Add-TwoColumnRow $updates "GitHub repository" $updateRepoNameBox
+    $updateRawUrlBox = New-SettingsTextBox ([string]$temp["UpdateRawUrl"])
+    Add-TwoColumnRow $updates "Raw update URL" $updateRawUrlBox
 
     $startupUpdateCheckBox = New-Object System.Windows.Controls.CheckBox
     $startupUpdateCheckBox.Content = "Check for updates on startup"
@@ -3789,32 +3955,28 @@ function Open-SettingsWindow {
     [void]$updates.Children.Add($updateButtonGrid)
 
     $updateStatusText = New-Object System.Windows.Controls.TextBlock
-    $updateStatusText.Text = "Uses GitHub Releases: https://github.com/$($temp["UpdateRepoOwner"])/$($temp["UpdateRepoName"])/releases/latest"
+    $updateStatusText.Text = "Scans the raw update file for a newer `$script:AppVersion value."
     $updateStatusText.FontSize = 12
     $updateStatusText.TextWrapping = "Wrap"
     $updateStatusText.Margin = [System.Windows.Thickness]::new(0, 8, 0, 0)
     [void]$updates.Children.Add($updateStatusText)
 
     $checkNowButton.Add_Click({
-        $oldOwner = $script:S["UpdateRepoOwner"]
-        $oldRepo = $script:S["UpdateRepoName"]
+        $oldUrl = $script:S["UpdateRawUrl"]
         try {
-            $script:S["UpdateRepoOwner"] = $updateRepoOwnerBox.Text.Trim()
-            $script:S["UpdateRepoName"] = $updateRepoNameBox.Text.Trim()
-            $updateStatusText.Text = "Checking GitHub releases..."
+            $script:S["UpdateRawUrl"] = $updateRawUrlBox.Text.Trim()
+            $updateStatusText.Text = "Checking raw update file..."
             $hasUpdate = Check-ForUpdates -Interactive
-            if ($hasUpdate) { $updateStatusText.Text = "Update available. Use Update Now to install." }
+            if ($hasUpdate) { $updateStatusText.Text = "Update available. Use Update Now to install, or use the update prompt." }
             else { $updateStatusText.Text = "No update available for v$script:AppVersion." }
         }
         finally {
-            $script:S["UpdateRepoOwner"] = $oldOwner
-            $script:S["UpdateRepoName"] = $oldRepo
+            $script:S["UpdateRawUrl"] = $oldUrl
         }
     })
 
     $updateNowButton.Add_Click({
-        $script:S["UpdateRepoOwner"] = $updateRepoOwnerBox.Text.Trim()
-        $script:S["UpdateRepoName"] = $updateRepoNameBox.Text.Trim()
+        $script:S["UpdateRawUrl"] = $updateRawUrlBox.Text.Trim()
         $script:S["CheckForUpdatesOnStartup"] = [bool]$startupUpdateCheckBox.IsChecked
         Save-Config
         Start-AppUpdate
@@ -3880,8 +4042,7 @@ function Open-SettingsWindow {
             $exportDirectoryBox.Text = $script:S["ExportDirectory"]
         }
         $script:S["DynamicListFontSizing"] = [bool]$dynamicListFontCheckBox.IsChecked
-        $script:S["UpdateRepoOwner"] = $updateRepoOwnerBox.Text.Trim()
-        $script:S["UpdateRepoName"] = $updateRepoNameBox.Text.Trim()
+        $script:S["UpdateRawUrl"] = $updateRawUrlBox.Text.Trim()
         $script:S["CheckForUpdatesOnStartup"] = [bool]$startupUpdateCheckBox.IsChecked
         $script:S["AutoSaveEnabled"] = [bool]$autoSaveCheckBox.IsChecked
         $script:S["AutoSaveIntervalMinutes"] = Get-ClampedInt $autoSaveIntervalBox.Text $script:S["AutoSaveIntervalMinutes"] 1 1440
@@ -4175,6 +4336,7 @@ $script:MainWindow.Add_Loaded({
 
 Apply-Settings
 Update-DefaultStatus
+Show-UpdateCompleteNotice
 Start-StartupUpdateCheck
 
 [void]$script:MainWindow.ShowDialog()
