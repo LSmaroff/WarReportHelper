@@ -1,7 +1,9 @@
-﻿# Quick legacy updater for War Report Helper
-# This replaces the installed WarReportHelper.ps1 with the latest raw GitHub version.
+﻿# War Report Helper - Slow Network Legacy Updater
+# Replaces the installed WarReportHelper.ps1 with the latest raw GitHub version.
+# Designed for restricted/slow networks where GitHub raw files may take up to several minutes.
 
 $ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
 
 $UpdateUrl = "https://raw.githubusercontent.com/LSmaroff/WarReportHelper/refs/heads/main/src/UpdatedWarReportHelper"
 
@@ -9,8 +11,93 @@ $InstallFolder = Join-Path ([Environment]::GetFolderPath("MyDocuments")) "War Re
 $TargetScript = Join-Path $InstallFolder "WarReportHelper.ps1"
 $BackupFolder = Join-Path $InstallFolder "Backups"
 
-try {
+$TimeoutSeconds = 300
+$RetryCount = 4
+$RetryDelaySeconds = 10
+
+function Get-SlowNetworkText {
+    param(
+        [string]$Url,
+        [int]$TimeoutSeconds = 300
+    )
+
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+    $request = [System.Net.HttpWebRequest]::Create($Url)
+    $request.Method = "GET"
+    $request.UserAgent = "WarReportHelper-LegacyUpdater"
+    $request.Accept = "text/plain,*/*"
+    $request.Timeout = $TimeoutSeconds * 1000
+    $request.ReadWriteTimeout = $TimeoutSeconds * 1000
+    $request.AllowAutoRedirect = $true
+    $request.KeepAlive = $false
+    $request.CachePolicy = New-Object System.Net.Cache.RequestCachePolicy ([System.Net.Cache.RequestCacheLevel]::NoCacheNoStore)
+
+    if ([System.Net.WebRequest]::DefaultWebProxy -ne $null) {
+        $request.Proxy = [System.Net.WebRequest]::DefaultWebProxy
+        $request.Proxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
+    }
+
+    $response = $null
+    $stream = $null
+    $reader = $null
+
+    try {
+        $response = $request.GetResponse()
+        $stream = $response.GetResponseStream()
+        $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8, $true)
+        return $reader.ReadToEnd()
+    }
+    finally {
+        if ($reader) { $reader.Close() }
+        if ($stream) { $stream.Close() }
+        if ($response) { $response.Close() }
+    }
+}
+
+function Get-UpdatedScriptText {
+    param([string]$Url)
+
+    $lastError = $null
+
+    for ($attempt = 1; $attempt -le $RetryCount; $attempt++) {
+        try {
+            Write-Host "Download attempt $attempt of $RetryCount..."
+            Write-Host "This may take a minute on restricted networks."
+
+            $text = Get-SlowNetworkText -Url $Url -TimeoutSeconds $TimeoutSeconds
+
+            if ([string]::IsNullOrWhiteSpace($text)) {
+                throw "Downloaded update was empty."
+            }
+
+            if ($text -notmatch '\$script:AppVersion\s*=\s*[''"]([^''"]+)[''"]') {
+                throw "Downloaded file does not look like a valid War Report Helper script."
+            }
+
+            return $text
+        }
+        catch {
+            $lastError = $_.Exception.Message
+            Write-Host "Attempt $attempt failed: $lastError"
+
+            if ($attempt -lt $RetryCount) {
+                Write-Host "Waiting $RetryDelaySeconds seconds before retrying..."
+                Start-Sleep -Seconds $RetryDelaySeconds
+            }
+        }
+    }
+
+    throw "Failed to download update after $RetryCount attempts. Last error: $lastError"
+}
+
+try {
+    Write-Host ""
+    Write-Host "War Report Helper Legacy Updater"
+    Write-Host "--------------------------------"
+    Write-Host "Install folder: $InstallFolder"
+    Write-Host "Update URL: $UpdateUrl"
+    Write-Host ""
 
     if (-not (Test-Path $InstallFolder)) {
         throw "Install folder not found: $InstallFolder"
@@ -24,32 +111,26 @@ try {
         New-Item -ItemType Directory -Path $BackupFolder -Force | Out-Null
     }
 
+    $updatedScript = Get-UpdatedScriptText -Url $UpdateUrl
+
+    $versionMatch = [regex]::Match($updatedScript, '\$script:AppVersion\s*=\s*[''"]([^''"]+)[''"]')
+    $newVersion = $versionMatch.Groups[1].Value
+
     $timestamp = Get-Date -Format "MM-dd-yyyy_HH-mm-ss"
     $backupPath = Join-Path $BackupFolder "WarReportHelper_Backup_$timestamp.ps1"
 
-    Write-Host "Downloading latest War Report Helper script..."
-    $updatedScript = Invoke-WebRequest -Uri $UpdateUrl -UseBasicParsing -Headers @{
-        "User-Agent" = "WarReportHelper-LegacyUpdater"
-    }
-
-    $scriptText = $updatedScript.Content
-
-    if ([string]::IsNullOrWhiteSpace($scriptText)) {
-        throw "Downloaded update was empty."
-    }
-
-    if ($scriptText -notmatch '\$script:AppVersion') {
-        throw "Downloaded file does not look like a valid War Report Helper script."
-    }
-
+    Write-Host ""
+    Write-Host "Downloaded version: $newVersion"
     Write-Host "Backing up current script..."
     Copy-Item -Path $TargetScript -Destination $backupPath -Force
 
     Write-Host "Installing update..."
-    Set-Content -Path $TargetScript -Value $scriptText -Encoding UTF8 -Force
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($TargetScript, $updatedScript, $utf8NoBom)
 
     Write-Host ""
     Write-Host "Update complete."
+    Write-Host "Installed version: $newVersion"
     Write-Host "Backup saved to: $backupPath"
     Write-Host ""
 
@@ -67,6 +148,13 @@ catch {
     Write-Host ""
     Write-Host "Update failed:"
     Write-Host $_.Exception.Message
+    Write-Host ""
+    Write-Host "Things to check:"
+    Write-Host "1. Open this URL in a browser on the same machine:"
+    Write-Host "   $UpdateUrl"
+    Write-Host "2. If it loads slowly, run this updater again and let it sit for up to 5 minutes per attempt."
+    Write-Host "3. Make sure the installed script exists at:"
+    Write-Host "   $TargetScript"
     Write-Host ""
     Read-Host "Press Enter to close"
 }
