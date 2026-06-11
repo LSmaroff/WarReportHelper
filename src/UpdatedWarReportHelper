@@ -1,11 +1,11 @@
-# War Report Helper / Completed Tasks GUI
-# Version 3.3.1 - Domain-aware network update fallback.
+﻿# War Report Helper / Completed Tasks GUI
+# Version 3.4.0 - QoL workflow update.
 
 param(
     [switch]$ShowUpdateComplete
 )
 
-$script:AppVersion = "3.3.1"
+$script:AppVersion = "3.4.0"
 $script:AppFontFamily = "Nunito, Segoe UI"
 $script:AvailableFontFamilies = @(
     "Nunito, Segoe UI",
@@ -21,11 +21,14 @@ $script:AvailableFontFamilies = @(
     "Consolas"
 )
 $script:AppReleaseNotes = @(
-    "Added a domain-aware network update fallback for .mil/domain-connected machines when GitHub raw update access is unavailable.",
-    "The updater now checks the 58 SOW network distribution folder only when the computer appears connected to area52.afnoapps.usaf.mil or another .mil domain/suffix.",
-    "The network fallback can read either UpdatedWarReportHelper or WarReportHelper.ps1 from the configured network folder.",
-    "Added Settings fields for the network update fallback folder and fallback file names.",
-    "Kept GitHub as the primary update source and preserved current tasks, task counters, Friday 1400 Mountain Time WAR compilation, themes, fonts, and dad jokes."
+    "Added one-click Done/Move workflow behavior for Current Tasks and Completed Tasks.",
+    "Added automatic timestamps for newly started/current tasks and completed tasks.",
+    "Added a quick search/filter box for the displayed task list.",
+    "Added Undo Last Action support for add, delete, edit, move, and counter changes.",
+    "Added keyboard shortcuts: Ctrl+Enter, Ctrl+S, Ctrl+F, Ctrl+Z, Ctrl+1, Ctrl+2, and Delete.",
+    "Added Compact Mode to reduce spacing and hide the dad joke for a tighter work view.",
+    "Added a WAR Draft Preview option so users can inspect completed-task output before saving/weekly compilation.",
+    "Kept current tasks out of WAR drafts and preserved Friday 1400 Mountain Time weekly compilation."
 )
 
 # Relaunch in STA mode if needed
@@ -147,6 +150,7 @@ $script:DefaultSettings = [ordered]@{
     WindowWidth                 = 820
     WindowHeight                = 600
     ListVisible                 = $true
+    CompactModeEnabled          = $false
 }
 
 $script:AppearanceKeys = @(
@@ -192,6 +196,8 @@ $script:DadJokeFallback = ('I asked the router for advice. It said, ' + [char]0x
 $script:DadJokeWebClient = $null
 $script:JokeBlockControl = $null
 $script:DadJokeDisplayText = $null
+$script:UndoStack = New-Object System.Collections.Generic.List[object]
+$script:IsRestoringUndo = $false
 
 # -----------------------------
 # Helper Functions
@@ -455,7 +461,7 @@ function Load-Config {
                 if ($key -like "*Color") {
                     $script:S[$key] = Confirm-HexColor $config.$key $script:S[$key]
                 }
-                elseif ($key -in @("UseButtonIcons", "AutoSaveEnabled", "ListVisible", "DynamicListFontSizing", "CheckForUpdatesOnStartup")) {
+                elseif ($key -in @("UseButtonIcons", "AutoSaveEnabled", "ListVisible", "DynamicListFontSizing", "CheckForUpdatesOnStartup", "CompactModeEnabled")) {
                     $script:S[$key] = [bool]$config.$key
                 }
                 elseif ($key -in @("TitleFontSize", "SubtitleFontSize", "SectionLabelFontSize", "ListFontSize", "InputFontSize", "AutoSaveIntervalMinutes")) {
@@ -539,6 +545,101 @@ function Set-StatusMessage {
 
     if ($null -ne $StatusText) {
         $StatusText.Text = $Message
+    }
+}
+
+function Get-DisplayedTaskModeName {
+    if ($script:IsViewingPreviousList) { return "Previous" }
+    if ($script:IsViewingCurrentTasks) { return "Current" }
+    return "Completed"
+}
+
+function Push-UndoSnapshot {
+    param([string]$Action = "change")
+
+    if ($script:IsRestoringUndo) { return }
+    if ($null -eq $TaskList) { return }
+
+    try {
+        if (-not $script:IsViewingPreviousList) {
+            Save-DisplayedTasksToMemory
+        }
+
+        $snapshot = [pscustomobject]@{
+            Action                = $Action
+            Time                  = Get-Date
+            IsViewingPreviousList = [bool]$script:IsViewingPreviousList
+            IsViewingCurrentTasks = [bool]$script:IsViewingCurrentTasks
+            DisplayedTasks        = @(Get-CurrentTasks)
+            SavedTasks            = @($script:SavedTasks)
+            CurrentTasks          = @($script:CurrentTasks)
+            OpenedListDirty       = [bool]$script:OpenedListDirty
+        }
+
+        $script:UndoStack.Add($snapshot)
+        while ($script:UndoStack.Count -gt 20) {
+            $script:UndoStack.RemoveAt(0)
+        }
+
+        if ($null -ne $UndoButton) {
+            $UndoButton.IsEnabled = $true
+        }
+    }
+    catch {}
+}
+
+function Restore-UndoSnapshot {
+    param([object]$Snapshot)
+
+    if ($null -eq $Snapshot) { return }
+
+    $script:IsRestoringUndo = $true
+    try {
+        $script:SavedTasks = @($Snapshot.SavedTasks | ForEach-Object { [string]$_ })
+        $script:CurrentTasks = @($Snapshot.CurrentTasks | ForEach-Object { [string]$_ })
+        $script:IsViewingPreviousList = [bool]$Snapshot.IsViewingPreviousList
+        $script:IsViewingCurrentTasks = [bool]$Snapshot.IsViewingCurrentTasks
+        $script:OpenedListDirty = [bool]$Snapshot.OpenedListDirty
+
+        if ($script:IsViewingPreviousList) {
+            Load-TasksIntoList -Tasks @($Snapshot.DisplayedTasks | ForEach-Object { [string]$_ })
+        }
+        elseif ($script:IsViewingCurrentTasks) {
+            Load-TasksIntoList -Tasks @($script:CurrentTasks)
+        }
+        else {
+            Load-TasksIntoList -Tasks @($script:SavedTasks)
+        }
+
+        Update-DateDisplay
+        Update-ReturnButtonVisibility
+        Apply-ListVisibility
+        Update-TaskEntryModeText
+        Update-TaskActionButtonLabels
+        Apply-TaskFilter
+        Save-Config
+        Set-StatusMessage "Undid last action: $($Snapshot.Action)."
+    }
+    finally {
+        $script:IsRestoringUndo = $false
+    }
+}
+
+function Invoke-UndoLastAction {
+    if ($script:UndoStack.Count -le 0) {
+        Set-StatusMessage "Nothing to undo."
+        if ($null -ne $UndoButton) { $UndoButton.IsEnabled = $false }
+        return
+    }
+
+    $lastIndex = $script:UndoStack.Count - 1
+    $snapshot = $script:UndoStack[$lastIndex]
+    $script:UndoStack.RemoveAt($lastIndex)
+
+    Restore-UndoSnapshot -Snapshot $snapshot
+
+    if ($null -ne $UndoButton) {
+        $UndoButton.IsEnabled = ($script:UndoStack.Count -gt 0)
     }
 }
 
@@ -699,6 +800,8 @@ function Load-TasksIntoList {
     }
 
     Update-TaskCount
+    Update-TaskActionButtonLabels
+    Apply-TaskFilter
 }
 
 
@@ -747,6 +850,275 @@ function Refresh-DisplayedTaskList {
     Apply-ListVisibility
 }
 
+
+function Remove-TaskLifecycleTimestamp {
+    param([string]$TaskText)
+
+    $info = Get-TaskCountInfo -TaskText $TaskText
+    $base = [string]$info.BaseText
+    $base = $base -replace '^\s*-\s*\[(Started|Completed)\s+\d{4}\]\s*', '- '
+    return (Set-TaskCountText -BaseText $base -Count ([int]$info.Count))
+}
+
+function Set-TaskLifecycleTimestamp {
+    param(
+        [string]$TaskText,
+        [ValidateSet("Started", "Completed")]
+        [string]$Status
+    )
+
+    $info = Get-TaskCountInfo -TaskText $TaskText
+    $base = [string]$info.BaseText
+    $base = $base -replace '^\s*-\s*\[(Started|Completed)\s+\d{4}\]\s*', '- '
+    $normalized = Normalize-TaskText $base
+    $body = $normalized -replace '^\s*-\s*', ''
+    $stamp = (Get-MountainNow).ToString('HHmm')
+    $withStamp = "- [$Status $stamp] $body"
+    return (Set-TaskCountText -BaseText $withStamp -Count ([int]$info.Count))
+}
+
+function Apply-TaskFilter {
+    if ($null -eq $TaskList -or $null -eq $TaskSearchBox) { return }
+
+    $filter = ([string]$TaskSearchBox.Text).Trim()
+
+    try { $TaskList.UpdateLayout() } catch {}
+
+    $visibleCount = 0
+    for ($i = 0; $i -lt $TaskList.Items.Count; $i++) {
+        $itemText = [string]$TaskList.Items[$i]
+        $showItem = $true
+
+        if (-not [string]::IsNullOrWhiteSpace($filter)) {
+            $showItem = ($itemText.IndexOf($filter, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+        }
+
+        if ($showItem) { $visibleCount++ }
+
+        $container = $TaskList.ItemContainerGenerator.ContainerFromIndex($i)
+        if ($null -ne $container) {
+            if ($showItem) {
+                $container.Visibility = [System.Windows.Visibility]::Visible
+            }
+            else {
+                $container.Visibility = [System.Windows.Visibility]::Collapsed
+            }
+        }
+    }
+
+    if ($null -ne $ClearSearchButton) {
+        $ClearSearchButton.Visibility = if ([string]::IsNullOrWhiteSpace($filter)) { [System.Windows.Visibility]::Collapsed } else { [System.Windows.Visibility]::Visible }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($filter)) {
+        $ListHeaderText.Text = "$($ListHeaderText.Text -replace ' \| Filtered:.*$', '') | Filtered: $visibleCount"
+    }
+}
+
+function Update-TaskActionButtonLabels {
+    if ($null -eq $TaskList) { return }
+
+    try { $TaskList.UpdateLayout() } catch {}
+
+    for ($i = 0; $i -lt $TaskList.Items.Count; $i++) {
+        $container = $TaskList.ItemContainerGenerator.ContainerFromIndex($i)
+        if ($null -eq $container) { continue }
+
+        $buttons = Find-VisualChildren -Parent $container -Type ([System.Windows.Controls.Button])
+        foreach ($button in @($buttons)) {
+            if ([string]$button.Tag -eq "MoveTask") {
+                if ($script:IsViewingCurrentTasks) {
+                    $button.Content = "Done"
+                    $button.ToolTip = "Mark this current task complete"
+                }
+                elseif ($script:IsViewingPreviousList) {
+                    $button.Content = "Move"
+                    $button.ToolTip = "Move is only available for today's task lists"
+                }
+                else {
+                    $button.Content = "Move"
+                    $button.ToolTip = "Move this completed task back to Current Tasks"
+                }
+            }
+        }
+    }
+}
+
+function Find-VisualChildren {
+    param(
+        [object]$Parent,
+        [type]$Type
+    )
+
+    $results = New-Object System.Collections.Generic.List[object]
+    if ($null -eq $Parent) { return @($results) }
+
+    try {
+        $count = [System.Windows.Media.VisualTreeHelper]::GetChildrenCount($Parent)
+        for ($i = 0; $i -lt $count; $i++) {
+            $child = [System.Windows.Media.VisualTreeHelper]::GetChild($Parent, $i)
+            if ($null -ne $child -and $Type.IsAssignableFrom($child.GetType())) {
+                $results.Add($child)
+            }
+            foreach ($nested in @(Find-VisualChildren -Parent $child -Type $Type)) {
+                $results.Add($nested)
+            }
+        }
+    }
+    catch {}
+
+    return @($results.ToArray())
+}
+
+function Get-WarDraftPreviewText {
+    if (-not $script:IsViewingPreviousList) {
+        Save-DisplayedTasksToMemory
+    }
+
+    $tasks = @(Get-CompletedTasksForExport)
+    $nowMountain = Get-MountainNow
+    $monday = Get-WorkWeekMonday $nowMountain
+    $friday = Get-WorkWeekFriday $monday
+
+    $lines = @()
+    $lines += "WAR Draft Preview"
+    $lines += "Generated: $($nowMountain.ToString('MM-dd-yyyy HH:mm')) Mountain Time"
+    $lines += "Work Week: $($monday.ToString('dd MMM yyyy')) - $($friday.ToString('dd MMM yyyy'))"
+    $lines += ""
+    $lines += "Today's Completed Tasks"
+    $lines += "Saved: $($nowMountain.ToString('MM-dd-yyyy HH:mm'))"
+    $lines += ""
+
+    if ($tasks.Count -gt 0) {
+        $lines += $tasks
+    }
+    else {
+        $lines += "No completed tasks will be included yet."
+    }
+
+    $lines += ""
+    $lines += "Note: Current Tasks are intentionally not included in WAR drafts or weekly WAR files."
+    return ($lines -join "`r`n")
+}
+
+function Show-WarDraftPreviewWindow {
+    $previewText = Get-WarDraftPreviewText
+
+    $previewXaml = @"
+<Window
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="WAR Draft Preview"
+    Width="720"
+    Height="560"
+    MinWidth="560"
+    MinHeight="420"
+    WindowStartupLocation="CenterOwner"
+    FontFamily="Segoe UI"
+    Background="#FFF5F7FB">
+    <Border Padding="16" Background="#FFF5F7FB">
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            <TextBlock Text="WAR Draft Preview" FontSize="20" FontWeight="Bold" Margin="0,0,0,10"/>
+            <TextBox x:Name="PreviewTextBox" Grid.Row="1" IsReadOnly="True" AcceptsReturn="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" FontFamily="Consolas" FontSize="13" Padding="10"/>
+            <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+                <Button x:Name="CopyPreviewButton" Content="Copy Preview" Width="110" Height="34" Margin="0,0,8,0"/>
+                <Button x:Name="ClosePreviewButton" Content="Close" Width="90" Height="34"/>
+            </StackPanel>
+        </Grid>
+    </Border>
+</Window>
+"@
+
+    $previewWindow = Read-Xaml $previewXaml
+    $previewWindow.Owner = $script:MainWindow
+    $previewBox = $previewWindow.FindName("PreviewTextBox")
+    $copyButton = $previewWindow.FindName("CopyPreviewButton")
+    $closeButton = $previewWindow.FindName("ClosePreviewButton")
+    $previewBox.Text = $previewText
+
+    $copyButton.Add_Click({
+        [System.Windows.Clipboard]::SetText($previewBox.Text)
+    })
+    $closeButton.Add_Click({ $previewWindow.Close() })
+
+    [void]$previewWindow.ShowDialog()
+}
+
+function Apply-CompactMode {
+    if ($null -eq $TaskInput -or $null -eq $ListCard -or $null -eq $InputCard) { return }
+
+    if ([bool]$script:S["CompactModeEnabled"]) {
+        if ($null -ne $JokeBlock) { $JokeBlock.Visibility = [System.Windows.Visibility]::Collapsed }
+        $TaskInput.MinHeight = 46
+        $ListCard.Padding = [System.Windows.Thickness]::new(6)
+        $InputCard.Padding = [System.Windows.Thickness]::new(8)
+        if ($null -ne $CompactModePopupButton) { $CompactModePopupButton.Content = "Normal Mode" }
+    }
+    else {
+        if ($null -ne $JokeBlock) { $JokeBlock.Visibility = [System.Windows.Visibility]::Visible }
+        $TaskInput.MinHeight = 78
+        $ListCard.Padding = [System.Windows.Thickness]::new(8)
+        $InputCard.Padding = [System.Windows.Thickness]::new(10)
+        if ($null -ne $CompactModePopupButton) { $CompactModePopupButton.Content = "Compact Mode" }
+    }
+
+    Update-DynamicListFontSizing
+    if ($null -ne $TaskSearchBox -and -not [string]::IsNullOrWhiteSpace([string]$TaskSearchBox.Text)) {
+        Apply-TaskFilter
+    }
+}
+
+function Toggle-CompactMode {
+    $script:S["CompactModeEnabled"] = -not [bool]$script:S["CompactModeEnabled"]
+    Apply-CompactMode
+    Save-Config
+    if ([bool]$script:S["CompactModeEnabled"]) {
+        Set-StatusMessage "Compact Mode enabled."
+    }
+    else {
+        Set-StatusMessage "Compact Mode disabled."
+    }
+}
+
+function Remove-TaskAtIndex {
+    param([int]$Index)
+
+    if ($Index -lt 0 -or $Index -ge $TaskList.Items.Count) { return }
+
+    Push-UndoSnapshot -Action "delete task"
+    $removedTask = [string]$TaskList.Items[$Index]
+    $TaskList.Items.RemoveAt($Index)
+
+    if ($script:IsViewingPreviousList) {
+        Mark-DisplayedListDirty
+    }
+    elseif ($script:IsViewingCurrentTasks) {
+        $script:CurrentTasks = @(Get-CurrentTasks)
+    }
+    else {
+        $script:SavedTasks = @(Get-CurrentTasks)
+    }
+
+    Save-Config
+    Update-TaskCount
+    Apply-TaskFilter
+
+    if ($script:IsViewingPreviousList) {
+        Set-StatusMessage "Deleted task from previous list. Press Ctrl+Z to undo."
+    }
+    elseif ($script:IsViewingCurrentTasks) {
+        Set-StatusMessage "Deleted current task. Press Ctrl+Z to undo."
+    }
+    else {
+        Set-StatusMessage "Deleted completed task. Press Ctrl+Z to undo."
+    }
+}
+
 function Move-TaskBetweenCurrentAndCompleted {
     param([int]$Index)
 
@@ -759,27 +1131,31 @@ function Move-TaskBetweenCurrentAndCompleted {
         return
     }
 
+    Push-UndoSnapshot -Action "move task"
     $task = [string]$TaskList.Items[$Index]
     $TaskList.Items.RemoveAt($Index)
 
     if ($script:IsViewingCurrentTasks) {
         $script:CurrentTasks = @(Get-CurrentTasks)
-        if (-not ($script:SavedTasks -contains $task)) {
-            $script:SavedTasks += $task
+        $completedTask = Set-TaskLifecycleTimestamp -TaskText $task -Status "Completed"
+        if (-not ($script:SavedTasks -contains $completedTask)) {
+            $script:SavedTasks += $completedTask
         }
-        Set-StatusMessage "Moved task to Completed Tasks."
+        Set-StatusMessage "Marked current task complete. Press Ctrl+Z to undo."
     }
     else {
         $script:SavedTasks = @(Get-CurrentTasks)
-        if (-not ($script:CurrentTasks -contains $task)) {
-            $script:CurrentTasks += $task
+        $currentTask = Set-TaskLifecycleTimestamp -TaskText $task -Status "Started"
+        if (-not ($script:CurrentTasks -contains $currentTask)) {
+            $script:CurrentTasks += $currentTask
         }
-        Set-StatusMessage "Moved task to Current Tasks."
+        Set-StatusMessage "Moved task to Current Tasks. Press Ctrl+Z to undo."
     }
 
     Save-Config
     Update-TaskCount
     Update-DefaultStatus
+    Refresh-DisplayedTaskList
 }
 
 function Update-DateDisplay {
@@ -2209,7 +2585,7 @@ $mainXaml = @"
 
                     <Border
                         x:Name="SettingsPopupBorder"
-                        Width="180"
+                        Width="190"
                         Background="#FFF5F7FB"
                         BorderBrush="#FFCBD5E1"
                         BorderThickness="1"
@@ -2257,6 +2633,22 @@ $mainXaml = @"
                                 ToolTip="Check the configured raw GitHub update file for a newer version"/>
 
                             <Button
+                                x:Name="PreviewWarPopupButton"
+                                Content="Preview WAR Draft"
+                                Height="38"
+                                Margin="0,0,0,8"
+                                Style="{StaticResource ModernButton}"
+                                ToolTip="Preview the completed-task WAR draft output"/>
+
+                            <Button
+                                x:Name="CompactModePopupButton"
+                                Content="Compact Mode"
+                                Height="38"
+                                Margin="0,0,0,8"
+                                Style="{StaticResource ModernButton}"
+                                ToolTip="Toggle compact spacing for the main window"/>
+
+                            <Button
                                 x:Name="HelpPopupButton"
                                 Content="Help"
                                 Height="38"
@@ -2267,16 +2659,51 @@ $mainXaml = @"
                 </Popup>
             </Grid>
 
-            <Button
-                x:Name="ToggleButton"
-                Grid.Row="1"
-                Content="Show Current Tasks"
-                Width="180"
-                Height="38"
-                HorizontalAlignment="Left"
-                Margin="0,0,0,12"
-                Style="{StaticResource ModernButton}"
-                ToolTip="Switch between Completed Tasks and Current Tasks"/>
+            <Grid Grid.Row="1" Margin="0,0,0,12">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+
+                <Button
+                    x:Name="ToggleButton"
+                    Grid.Column="0"
+                    Content="Show Current Tasks"
+                    Width="180"
+                    Height="38"
+                    HorizontalAlignment="Left"
+                    Style="{StaticResource ModernButton}"
+                    ToolTip="Switch between Completed Tasks and Current Tasks"/>
+
+                <Border
+                    Grid.Column="1"
+                    Height="38"
+                    Margin="12,0,0,0"
+                    Background="White"
+                    BorderBrush="#FFCBD5E1"
+                    BorderThickness="1"
+                    CornerRadius="12"
+                    Padding="10,0">
+                    <TextBox
+                        x:Name="TaskSearchBox"
+                        BorderThickness="0"
+                        Background="Transparent"
+                        VerticalContentAlignment="Center"
+                        ToolTip="Search/filter the visible task list. Press Ctrl+F to focus here."/>
+                </Border>
+
+                <Button
+                    x:Name="ClearSearchButton"
+                    Grid.Column="2"
+                    Content="X"
+                    Width="38"
+                    Height="38"
+                    Margin="8,0,0,0"
+                    Visibility="Collapsed"
+                    Style="{StaticResource ModernButton}"
+                    ToolTip="Clear search"/>
+            </Grid>
 
             <TextBlock
                 x:Name="ListHeaderText"
@@ -2301,7 +2728,7 @@ $mainXaml = @"
                     ScrollViewer.HorizontalScrollBarVisibility="Disabled">
                     <ListBox.ItemTemplate>
                         <DataTemplate>
-                            <Grid>
+                            <Grid Width="{Binding ActualWidth, RelativeSource={RelativeSource AncestorType=ListBox}}">
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="*"/>
                                     <ColumnDefinition Width="Auto"/>
@@ -2335,6 +2762,7 @@ $mainXaml = @"
                                 <Button
                                     Grid.Column="3"
                                     Content="Move"
+                                    MinWidth="64"
                                     Tag="MoveTask"
                                     ToolTip="Move this task between Current Tasks and Completed Tasks"
                                     Style="{StaticResource EditTaskButtonStyle}"/>
@@ -2414,11 +2842,29 @@ $mainXaml = @"
                 BorderThickness="1"
                 CornerRadius="10"
                 Padding="10,6">
-                <TextBlock
-                    x:Name="StatusText"
-                    Text="Ready."
-                    FontSize="12"
-                    TextTrimming="CharacterEllipsis"/>
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock
+                        x:Name="StatusText"
+                        Grid.Column="0"
+                        Text="Ready."
+                        FontSize="12"
+                        VerticalAlignment="Center"
+                        TextTrimming="CharacterEllipsis"/>
+                    <Button
+                        x:Name="UndoButton"
+                        Grid.Column="1"
+                        Content="Undo"
+                        Width="70"
+                        Height="26"
+                        Margin="10,0,0,0"
+                        IsEnabled="False"
+                        Style="{StaticResource ModernButton}"
+                        ToolTip="Undo the last task action (Ctrl+Z)"/>
+                </Grid>
             </Border>
         </Grid>
     </Border>
@@ -2455,11 +2901,15 @@ $SaveListPopupButton = $script:MainWindow.FindName("SaveListPopupButton")
 $OpenPreviousListPopupButton = $script:MainWindow.FindName("OpenPreviousListPopupButton")
 $CheckUpdatesPopupButton = $script:MainWindow.FindName("CheckUpdatesPopupButton")
 $HelpPopupButton = $script:MainWindow.FindName("HelpPopupButton")
+$PreviewWarPopupButton = $script:MainWindow.FindName("PreviewWarPopupButton")
+$CompactModePopupButton = $script:MainWindow.FindName("CompactModePopupButton")
 $ReturnTodayButton = $script:MainWindow.FindName("ReturnTodayButton")
 
 $ToggleButton = $script:MainWindow.FindName("ToggleButton")
 $ListCard = $script:MainWindow.FindName("ListCard")
 $TaskList = $script:MainWindow.FindName("TaskList")
+$TaskSearchBox = $script:MainWindow.FindName("TaskSearchBox")
+$ClearSearchButton = $script:MainWindow.FindName("ClearSearchButton")
 $TaskInput = $script:MainWindow.FindName("TaskInput")
 $SubmitButton = $script:MainWindow.FindName("SubmitButton")
 $RootGrid = $script:MainWindow.FindName("RootGrid")
@@ -2467,6 +2917,7 @@ $InputCard = $script:MainWindow.FindName("InputCard")
 $ListRow = $script:MainWindow.FindName("ListRow")
 $StatusBorder = $script:MainWindow.FindName("StatusBorder")
 $StatusText = $script:MainWindow.FindName("StatusText")
+$UndoButton = $script:MainWindow.FindName("UndoButton")
 
 $script:TaskListControl = $TaskList
 
@@ -2659,6 +3110,13 @@ function Update-Placeholder {
 
 function Update-DynamicListFontSizing {
     if ($null -eq $TaskList -or $null -eq $ListCard -or $null -eq $script:MainWindow) {
+        return
+    }
+
+    if ([bool]$script:S["CompactModeEnabled"]) {
+        $TaskList.FontSize = [Math]::Max(9, ([double]$script:S["ListFontSize"] - 1))
+        $script:MainWindow.Resources["ListItemPadding"] = [System.Windows.Thickness]::new(8, 3, 8, 3)
+        $script:MainWindow.Resources["ListItemMargin"] = [System.Windows.Thickness]::new(0, 0, 0, 0)
         return
     }
 
@@ -2895,7 +3353,11 @@ function Apply-Settings {
     Set-WpfButtonStyle $SaveListPopupButton
     Set-WpfButtonStyle $OpenPreviousListPopupButton
     Set-WpfButtonStyle $CheckUpdatesPopupButton
+    Set-WpfButtonStyle $PreviewWarPopupButton
+    Set-WpfButtonStyle $CompactModePopupButton
     Set-WpfButtonStyle $HelpPopupButton
+    Set-WpfButtonStyle $ClearSearchButton
+    Set-WpfButtonStyle $UndoButton
 
     $SettingsPopupBorder.Background = New-Brush $script:S["WindowBackgroundColor"]
     $SettingsPopupBorder.BorderBrush = New-Brush $script:S["WindowBorderColor"]
@@ -2928,7 +3390,11 @@ function Apply-Settings {
     $SaveListPopupButton.ToolTip = "Choose where to save a copy of the task list"
     $OpenPreviousListPopupButton.ToolTip = "Open a previously saved task list without replacing today's tasks"
     $CheckUpdatesPopupButton.ToolTip = "Check the configured raw GitHub update file for a newer version"
+    $PreviewWarPopupButton.ToolTip = "Preview the completed-task WAR draft output"
+    $CompactModePopupButton.ToolTip = "Toggle compact spacing for the main window"
     $HelpPopupButton.ToolTip = "Show how to use this app"
+    $TaskSearchBox.ToolTip = "Search/filter the displayed list. Ctrl+F focuses here."
+    $UndoButton.ToolTip = "Undo the last task action. Keyboard: Ctrl+Z"
 
     Apply-ListVisibility
     Update-TaskEntryModeText
@@ -2937,6 +3403,9 @@ function Apply-Settings {
     Update-DateDisplay
     Update-ReturnButtonVisibility
     Update-AutoSaveTimer
+    Apply-CompactMode
+    Apply-TaskFilter
+    Update-TaskActionButtonLabels
 }
 
 function Submit-Task {
@@ -2947,6 +3416,16 @@ function Submit-Task {
 
         $newTask = Normalize-TaskText $newTask
 
+        if (-not $script:IsViewingPreviousList) {
+            if ($script:IsViewingCurrentTasks) {
+                $newTask = Set-TaskLifecycleTimestamp -TaskText $newTask -Status "Started"
+            }
+            else {
+                $newTask = Set-TaskLifecycleTimestamp -TaskText $newTask -Status "Completed"
+            }
+        }
+
+        Push-UndoSnapshot -Action "add task"
         [void]$TaskList.Items.Add($newTask)
         $TaskInput.Clear()
 
@@ -2957,6 +3436,8 @@ function Submit-Task {
         Save-Config
         Update-TaskCount
         Update-Placeholder
+        Apply-TaskFilter
+        Update-TaskActionButtonLabels
 
         if ($script:IsViewingPreviousList) {
             Set-StatusMessage "Task added to previous list. Changes are not saved to that file yet."
@@ -3069,6 +3550,7 @@ function Change-TaskCounter {
         return
     }
 
+    Push-UndoSnapshot -Action "change task count"
     $currentTask = [string]$TaskList.Items[$Index]
     $info = Get-TaskCountInfo -TaskText $currentTask
     $newCount = [Math]::Max(1, ([int]$info.Count + [int]$Delta))
@@ -3088,6 +3570,8 @@ function Change-TaskCounter {
 
     Save-Config
     Update-TaskCount
+    Apply-TaskFilter
+    Update-TaskActionButtonLabels
 
     if ($script:IsViewingPreviousList) {
         Set-StatusMessage "Previous list task count updated to x$newCount. Changes are not saved to that file yet."
@@ -3534,7 +4018,7 @@ How to use this app:
 2. Press Submit or Enter to add it to the completed task list.
 3. Hover over or select a task to reveal Edit and Delete.
 4. Use Edit to fix typos.
-5. Use Hide Completed Tasks to collapse the task list.
+5. Use Show Current Tasks to switch between completed work and work currently in progress.
 6. Use Options > Save List Now to manually save the task list.
 7. Use Options > Settings to choose themes, save custom themes, customize colors/fonts/icons, set export location, and control auto-save.
 8. Use theme strings to share custom themes with other users.
@@ -5029,6 +5513,18 @@ function Show-SettingsPopup {
     )
 }
 
+function Toggle-TaskView {
+    if ($script:IsViewingPreviousList) {
+        Set-StatusMessage "Return to Today before switching between Current Tasks and Completed Tasks."
+        return
+    }
+
+    Save-DisplayedTasksToMemory
+    $script:IsViewingCurrentTasks = -not [bool]$script:IsViewingCurrentTasks
+    Refresh-DisplayedTaskList
+    Save-Config
+}
+
 # -----------------------------
 # Main Events
 # -----------------------------
@@ -5098,16 +5594,37 @@ $HelpPopupButton.Add_Click({
     Show-HelpWindow
 })
 
-$ToggleButton.Add_Click({
-    if ($script:IsViewingPreviousList) {
-        Set-StatusMessage "Return to Today before switching between Current Tasks and Completed Tasks."
-        return
-    }
+$PreviewWarPopupButton.Add_Click({
+    $SettingsPopup.IsOpen = $false
+    Show-WarDraftPreviewWindow
+})
 
-    Save-DisplayedTasksToMemory
-    $script:IsViewingCurrentTasks = -not [bool]$script:IsViewingCurrentTasks
-    Refresh-DisplayedTaskList
-    Save-Config
+$CompactModePopupButton.Add_Click({
+    $SettingsPopup.IsOpen = $false
+    Toggle-CompactMode
+})
+
+$ClearSearchButton.Add_Click({
+    $TaskSearchBox.Clear()
+    Apply-TaskFilter
+})
+
+$UndoButton.Add_Click({
+    Invoke-UndoLastAction
+})
+
+$TaskSearchBox.Add_TextChanged({
+    Update-TaskCount
+    Apply-TaskFilter
+})
+
+$TaskList.ItemContainerGenerator.Add_StatusChanged({
+    Update-TaskActionButtonLabels
+    Apply-TaskFilter
+})
+
+$ToggleButton.Add_Click({
+    Toggle-TaskView
 })
 
 $SubmitButton.Add_Click({
@@ -5129,6 +5646,46 @@ $TaskInput.Add_PreviewKeyDown({
     if ($e.Key -eq [System.Windows.Input.Key]::Return -and -not $shiftDown) {
         $e.Handled = $true
         Submit-Task
+    }
+})
+
+$script:MainWindow.Add_PreviewKeyDown({
+    param($sender, $e)
+
+    $isCtrl = ([System.Windows.Input.Keyboard]::Modifiers -band [System.Windows.Input.ModifierKeys]::Control) -eq [System.Windows.Input.ModifierKeys]::Control
+
+    if ($isCtrl -and $e.Key -eq [System.Windows.Input.Key]::Enter) {
+        Submit-Task
+        $e.Handled = $true
+    }
+    elseif ($isCtrl -and $e.Key -eq [System.Windows.Input.Key]::S) {
+        [void](Save-TaskList -ShowMessage)
+        $e.Handled = $true
+    }
+    elseif ($isCtrl -and $e.Key -eq [System.Windows.Input.Key]::F) {
+        $TaskSearchBox.Focus() | Out-Null
+        $TaskSearchBox.SelectAll()
+        $e.Handled = $true
+    }
+    elseif ($isCtrl -and $e.Key -eq [System.Windows.Input.Key]::Z) {
+        Invoke-UndoLastAction
+        $e.Handled = $true
+    }
+    elseif ($isCtrl -and $e.Key -eq [System.Windows.Input.Key]::D1) {
+        if ($script:IsViewingPreviousList) { Return-ToCurrentDayTasks }
+        if ($script:IsViewingCurrentTasks) { Toggle-TaskView }
+        $e.Handled = $true
+    }
+    elseif ($isCtrl -and $e.Key -eq [System.Windows.Input.Key]::D2) {
+        if ($script:IsViewingPreviousList) { Return-ToCurrentDayTasks }
+        if (-not $script:IsViewingCurrentTasks) { Toggle-TaskView }
+        $e.Handled = $true
+    }
+    elseif (-not $isCtrl -and $e.Key -eq [System.Windows.Input.Key]::Delete) {
+        if ($TaskList.IsKeyboardFocusWithin -and $TaskList.SelectedIndex -ge 0) {
+            Remove-TaskAtIndex -Index $TaskList.SelectedIndex
+            $e.Handled = $true
+        }
     }
 })
 
@@ -5168,32 +5725,7 @@ $TaskList.AddHandler(
             $e.Handled = $true
         }
         elseif ([string]$button.Tag -eq "DeleteTask") {
-            $removedTask = [string]$TaskList.Items[$index]
-            $TaskList.Items.RemoveAt($index)
-
-            if ($script:IsViewingPreviousList) {
-                Mark-DisplayedListDirty
-            }
-            elseif ($script:IsViewingCurrentTasks) {
-                $script:CurrentTasks = @(Get-CurrentTasks)
-            }
-            else {
-                $script:SavedTasks = @(Get-CurrentTasks)
-            }
-
-            Save-Config
-            Update-TaskCount
-
-            if ($script:IsViewingPreviousList) {
-                Set-StatusMessage "Deleted task from previous list. Changes are not saved to that file yet."
-            }
-            elseif ($script:IsViewingCurrentTasks) {
-                Set-StatusMessage "Deleted current task: $removedTask"
-            }
-            else {
-                Set-StatusMessage "Deleted task: $removedTask"
-            }
-
+            Remove-TaskAtIndex -Index $index
             $e.Handled = $true
         }
         elseif ([string]$button.Tag -eq "EditTask") {
@@ -5202,7 +5734,17 @@ $TaskList.AddHandler(
             $editResult = Show-EditTaskWindow $taskInfo.BaseText
 
             if ($editResult.Saved) {
-                $TaskList.Items[$index] = Set-TaskCountText -BaseText ([string]$editResult.Text) -Count ([int]$taskInfo.Count)
+                Push-UndoSnapshot -Action "edit task"
+                $editedBase = [string]$editResult.Text
+                if (-not $script:IsViewingPreviousList) {
+                    if ($script:IsViewingCurrentTasks) {
+                        $editedBase = Set-TaskLifecycleTimestamp -TaskText $editedBase -Status "Started"
+                    }
+                    else {
+                        $editedBase = Set-TaskLifecycleTimestamp -TaskText $editedBase -Status "Completed"
+                    }
+                }
+                $TaskList.Items[$index] = Set-TaskCountText -BaseText $editedBase -Count ([int]$taskInfo.Count)
 
                 if ($script:IsViewingPreviousList) {
                     Mark-DisplayedListDirty
@@ -5216,6 +5758,8 @@ $TaskList.AddHandler(
 
                 Save-Config
                 Update-TaskCount
+                Apply-TaskFilter
+                Update-TaskActionButtonLabels
 
                 if ($script:IsViewingPreviousList) {
                     Set-StatusMessage "Previous list task updated. Changes are not saved to that file yet."
