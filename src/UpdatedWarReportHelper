@@ -1,7 +1,32 @@
-﻿# War Report Helper / Completed Tasks GUI - Themed UI Refresh
-# Adds a custom animated theme preset selector, reliable live preview tooltips, fixed preview action buttons, themed custom title bar, and clearer text rendering.
+# War Report Helper / Completed Tasks GUI
+# Version 3.3.1 - Domain-aware network update fallback.
 
-$script:AppVersion = "1.4.0"
+param(
+    [switch]$ShowUpdateComplete
+)
+
+$script:AppVersion = "3.3.1"
+$script:AppFontFamily = "Nunito, Segoe UI"
+$script:AvailableFontFamilies = @(
+    "Nunito, Segoe UI",
+    "Segoe UI",
+    "Aptos",
+    "Calibri",
+    "Comic Sans MS",
+    "Arial",
+    "Verdana",
+    "Tahoma",
+    "Trebuchet MS",
+    "Georgia",
+    "Consolas"
+)
+$script:AppReleaseNotes = @(
+    "Added a domain-aware network update fallback for .mil/domain-connected machines when GitHub raw update access is unavailable.",
+    "The updater now checks the 58 SOW network distribution folder only when the computer appears connected to area52.afnoapps.usaf.mil or another .mil domain/suffix.",
+    "The network fallback can read either UpdatedWarReportHelper or WarReportHelper.ps1 from the configured network folder.",
+    "Added Settings fields for the network update fallback folder and fallback file names.",
+    "Kept GitHub as the primary update source and preserved current tasks, task counters, Friday 1400 Mountain Time WAR compilation, themes, fonts, and dad jokes."
+)
 
 # Relaunch in STA mode if needed
 if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne [System.Threading.ApartmentState]::STA) {
@@ -63,6 +88,7 @@ else {
 }
 
 $script:ConfigFile = Join-Path $script:ScriptDirectory "CompletedTasksGUI_Config.txt"
+$script:UpdateCompleteFile = Join-Path $script:ScriptDirectory "WarReportHelper_UpdateComplete.json"
 
 # -----------------------------
 # Defaults / Settings
@@ -74,6 +100,7 @@ $script:DefaultSettings = [ordered]@{
     ListFontSize                = 15
     DynamicListFontSizing       = $true
     InputFontSize               = 14
+    AppFontFamily               = "Nunito, Segoe UI"
 
     TitleFontColor              = "#FF1E293B"
     TitleOutlineColor           = "#FFFFFFFF"
@@ -109,10 +136,13 @@ $script:DefaultSettings = [ordered]@{
     AutoSaveEnabled             = $true
     AutoSaveIntervalMinutes     = 60
 
-    UpdateRepoOwner             = "LSmaroff"
-    UpdateRepoName              = "WarReportHelper"
+    UpdateRawUrl                = "https://raw.githubusercontent.com/LSmaroff/WarReportHelper/refs/heads/main/src/UpdatedWarReportHelper"
+    UpdateNetworkFolder         = "\\mhmv-fs-121v\KIRTLANDDFS\58SOW\ORG2\DataM\swdist\58SOW_Quick Tools\WAR Report Helper"
+    UpdateNetworkFileNames      = "UpdatedWarReportHelper;WarReportHelper.ps1"
+    DadJokesRawUrl              = "https://raw.githubusercontent.com/LSmaroff/WarReportHelper/refs/heads/main/jokes/dadjokes"
     CheckForUpdatesOnStartup    = $true
     LastWorkWeekMonday          = ""
+    LastCompiledWorkWeekMonday  = ""
 
     WindowWidth                 = 820
     WindowHeight                = 600
@@ -120,7 +150,7 @@ $script:DefaultSettings = [ordered]@{
 }
 
 $script:AppearanceKeys = @(
-    "TitleFontSize", "SubtitleFontSize", "SectionLabelFontSize", "ListFontSize", "InputFontSize",
+    "TitleFontSize", "SubtitleFontSize", "SectionLabelFontSize", "ListFontSize", "InputFontSize", "AppFontFamily",
     "TitleFontColor", "TitleOutlineColor", "SubtitleFontColor", "SectionLabelFontColor",
     "ListFontColor", "InputFontColor", "PlaceholderTextColor", "ButtonFontColor",
     "ListHoverTextColor", "SettingsMenuTextColor", "EditButtonFontColor", "DeleteButtonFontColor", "StatusTextColor",
@@ -134,9 +164,13 @@ foreach ($key in $script:DefaultSettings.Keys) {
 }
 
 $script:SavedTasks = @(
-    "• Checked email",
-    "• Completed morning report",
-    "• Updated task tracker"
+    "- Checked email",
+    "- Completed morning report",
+    "- Updated task tracker"
+)
+
+$script:CurrentTasks = @(
+    "- Review tasks currently in progress"
 )
 
 $script:MainWindow = $null
@@ -145,6 +179,7 @@ $script:AutoSaveTimer = $null
 $script:LastSaveTime = $null
 
 $script:IsViewingPreviousList = $false
+$script:IsViewingCurrentTasks = $false
 $script:OpenedListPath = ""
 $script:OpenedListDateText = ""
 $script:OpenedListSavedLine = ""
@@ -445,6 +480,10 @@ function Load-Config {
             $script:SavedTasks = @($config.Tasks | ForEach-Object { [string]$_ })
         }
 
+        if ($properties -contains "CurrentTasks") {
+            $script:CurrentTasks = @($config.CurrentTasks | ForEach-Object { [string]$_ })
+        }
+
         if ($properties -contains "CustomThemes") {
             $script:CustomThemes = [ordered]@{}
             foreach ($themeProperty in $config.CustomThemes.PSObject.Properties) {
@@ -482,12 +521,12 @@ function Save-Config {
             $config[$key] = $script:S[$key]
         }
 
-        if ($script:IsViewingPreviousList) {
-            $config["Tasks"] = @($script:CurrentDayTasksCache)
+        if (-not $script:IsViewingPreviousList) {
+            Save-DisplayedTasksToMemory
         }
-        else {
-            $config["Tasks"] = @(Get-CurrentTasks)
-        }
+
+        $config["Tasks"] = @($script:SavedTasks)
+        $config["CurrentTasks"] = @($script:CurrentTasks)
         $config["CustomThemes"] = $script:CustomThemes
 
         $config | ConvertTo-Json -Depth 10 | Set-Content -Path $script:ConfigFile -Encoding UTF8
@@ -610,8 +649,9 @@ function Read-TaskListFile {
                 continue
             }
 
-            if ($trimmed.StartsWith("•")) {
-                $tasks += $trimmed
+            $legacyBullet = [string][char]0x2022
+            if ($trimmed.StartsWith("- ") -or $trimmed.StartsWith($legacyBullet)) {
+                $tasks += (Normalize-TaskText $trimmed)
                 continue
             }
 
@@ -659,6 +699,87 @@ function Load-TasksIntoList {
     }
 
     Update-TaskCount
+}
+
+
+function Save-DisplayedTasksToMemory {
+    if ($script:IsViewingPreviousList) {
+        return
+    }
+
+    if ($script:IsViewingCurrentTasks) {
+        $script:CurrentTasks = @(Get-CurrentTasks)
+    }
+    else {
+        $script:SavedTasks = @(Get-CurrentTasks)
+    }
+}
+
+function Get-CompletedTasksForExport {
+    if ($script:IsViewingPreviousList) {
+        return @($script:SavedTasks)
+    }
+
+    if ($script:IsViewingCurrentTasks) {
+        $script:CurrentTasks = @(Get-CurrentTasks)
+        return @($script:SavedTasks)
+    }
+
+    $script:SavedTasks = @(Get-CurrentTasks)
+    return @($script:SavedTasks)
+}
+
+function Refresh-DisplayedTaskList {
+    if ($script:IsViewingPreviousList) {
+        return
+    }
+
+    if ($script:IsViewingCurrentTasks) {
+        Load-TasksIntoList -Tasks @($script:CurrentTasks)
+    }
+    else {
+        Load-TasksIntoList -Tasks @($script:SavedTasks)
+    }
+
+    Update-DateDisplay
+    Update-TaskCount
+    Update-DefaultStatus
+    Apply-ListVisibility
+}
+
+function Move-TaskBetweenCurrentAndCompleted {
+    param([int]$Index)
+
+    if ($script:IsViewingPreviousList) {
+        Set-StatusMessage "Move is only available for today's Current Tasks and Completed Tasks."
+        return
+    }
+
+    if ($Index -lt 0 -or $Index -ge $TaskList.Items.Count) {
+        return
+    }
+
+    $task = [string]$TaskList.Items[$Index]
+    $TaskList.Items.RemoveAt($Index)
+
+    if ($script:IsViewingCurrentTasks) {
+        $script:CurrentTasks = @(Get-CurrentTasks)
+        if (-not ($script:SavedTasks -contains $task)) {
+            $script:SavedTasks += $task
+        }
+        Set-StatusMessage "Moved task to Completed Tasks."
+    }
+    else {
+        $script:SavedTasks = @(Get-CurrentTasks)
+        if (-not ($script:CurrentTasks -contains $task)) {
+            $script:CurrentTasks += $task
+        }
+        Set-StatusMessage "Moved task to Current Tasks."
+    }
+
+    Save-Config
+    Update-TaskCount
+    Update-DefaultStatus
 }
 
 function Update-DateDisplay {
@@ -742,13 +863,14 @@ function Return-ToCurrentDayTasks {
     }
 
     $script:IsViewingPreviousList = $false
+    $script:IsViewingCurrentTasks = $false
     $script:OpenedListPath = ""
     $script:OpenedListDateText = ""
     $script:OpenedListSavedLine = ""
     $script:OpenedListDirty = $false
-
-    Load-TasksIntoList -Tasks @($script:CurrentDayTasksCache)
     $script:CurrentDayTasksCache = @()
+
+    Load-TasksIntoList -Tasks @($script:SavedTasks)
     Update-DateDisplay
     Update-ReturnButtonVisibility
     Update-DefaultStatus
@@ -762,7 +884,8 @@ function Open-PreviousTaskList {
         }
     }
     else {
-        $script:CurrentDayTasksCache = @(Get-CurrentTasks)
+        Save-DisplayedTasksToMemory
+        $script:CurrentDayTasksCache = @($script:SavedTasks)
         Save-Config
     }
 
@@ -836,11 +959,11 @@ function Save-TaskList {
             $filePath = Join-Path $exportDirectory $fileName
         }
 
-        if ($script:IsViewingPreviousList -and -not $ChooseLocation) {
-            $tasks = @($script:CurrentDayTasksCache)
+        if ($script:IsViewingPreviousList -and $ChooseLocation) {
+            $tasks = @(Get-CurrentTasks)
         }
         else {
-            $tasks = @(Get-CurrentTasks)
+            $tasks = @(Get-CompletedTasksForExport)
         }
 
         $exportContent = @()
@@ -965,54 +1088,132 @@ function Move-PreviousWeekFilesToArchive {
     catch {}
 }
 
+function Get-MountainNow {
+    try {
+        $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Mountain Standard Time")
+        return [System.TimeZoneInfo]::ConvertTimeFromUtc((Get-Date).ToUniversalTime(), $tz)
+    }
+    catch {
+        return (Get-Date)
+    }
+}
+
+function Compile-WeeklyWarIfNeeded {
+    param(
+        [datetime]$WeekMonday,
+        [datetime]$NowMountain,
+        [switch]$Force
+    )
+
+    $weekKey = $WeekMonday.ToString("yyyy-MM-dd")
+    if (-not $Force -and [string]$script:S["LastCompiledWorkWeekMonday"] -eq $weekKey) {
+        return
+    }
+
+    $weekFriday = Get-WorkWeekFriday $WeekMonday
+    $compileTime = $weekFriday.Date.AddHours(14)
+
+    if (-not $Force -and $NowMountain -lt $compileTime) {
+        return
+    }
+
+    $exportDirectory = Get-ExportDirectory
+    $archiveFolder = Join-Path $exportDirectory (Get-WeekFolderName $WeekMonday)
+    if (-not (Test-Path $archiveFolder)) {
+        [void](New-Item -ItemType Directory -Path $archiveFolder -Force)
+    }
+
+    $weeklyFile = Join-Path $archiveFolder (Get-WeekWarFileName $WeekMonday)
+    $weeklyFile = Get-UniqueFilePath $weeklyFile
+
+    $completedTasks = @($script:SavedTasks)
+    if (-not $script:IsViewingPreviousList -and -not $script:IsViewingCurrentTasks -and $null -ne $TaskList) {
+        $completedTasks = @(Get-CurrentTasks)
+        $script:SavedTasks = @($completedTasks)
+    }
+
+    if ($completedTasks.Count -gt 0) {
+        Write-TaskListFile `
+            -FilePath $weeklyFile `
+            -Tasks @($completedTasks) `
+            -SavedLine "Saved: $($NowMountain.ToString('MM-dd-yyyy HH:mm'))"
+    }
+
+    Move-PreviousWeekFilesToArchive -WeekMonday $WeekMonday -ArchiveFolder $archiveFolder
+    $script:S["LastCompiledWorkWeekMonday"] = $weekKey
+    Save-Config
+}
+
 function Initialize-WorkWeekTracking {
     try {
-        $currentMonday = Get-WorkWeekMonday
+        $nowMountain = Get-MountainNow
+        $currentMonday = Get-WorkWeekMonday $nowMountain
         $currentKey = $currentMonday.ToString("yyyy-MM-dd")
 
         if ([string]::IsNullOrWhiteSpace($script:S["LastWorkWeekMonday"])) {
             $script:S["LastWorkWeekMonday"] = $currentKey
-            return
+            Save-Config
         }
 
-        if ($script:S["LastWorkWeekMonday"] -eq $currentKey) {
-            return
-        }
-
+        $trackedMonday = $currentMonday
         try {
-            $previousMonday = [datetime]::ParseExact(
-                [string]$script:S["LastWorkWeekMonday"],
-                "yyyy-MM-dd",
-                [System.Globalization.CultureInfo]::InvariantCulture
-            )
+            if (-not [string]::IsNullOrWhiteSpace($script:S["LastWorkWeekMonday"])) {
+                $trackedMonday = [datetime]::ParseExact(
+                    [string]$script:S["LastWorkWeekMonday"],
+                    "yyyy-MM-dd",
+                    [System.Globalization.CultureInfo]::InvariantCulture
+                )
+            }
         }
         catch {
-            $previousMonday = $currentMonday.AddDays(-7)
+            $trackedMonday = $currentMonday
         }
 
-        $exportDirectory = Get-ExportDirectory
-        $archiveFolder = Join-Path $exportDirectory (Get-WeekFolderName $previousMonday)
-        if (-not (Test-Path $archiveFolder)) {
-            [void](New-Item -ItemType Directory -Path $archiveFolder -Force)
+        if ($trackedMonday.Date -lt $currentMonday.Date) {
+            $trackedKey = $trackedMonday.ToString("yyyy-MM-dd")
+
+            if ([string]$script:S["LastCompiledWorkWeekMonday"] -ne $trackedKey) {
+                Compile-WeeklyWarIfNeeded -WeekMonday $trackedMonday -NowMountain $nowMountain -Force
+            }
+            else {
+                $exportDirectory = Get-ExportDirectory
+                $archiveFolder = Join-Path $exportDirectory (Get-WeekFolderName $trackedMonday)
+                if (-not (Test-Path $archiveFolder)) {
+                    [void](New-Item -ItemType Directory -Path $archiveFolder -Force)
+                }
+                Move-PreviousWeekFilesToArchive -WeekMonday $trackedMonday -ArchiveFolder $archiveFolder
+            }
+
+            $script:SavedTasks = @()
+            $script:S["LastWorkWeekMonday"] = $currentKey
+
+            if (-not $script:IsViewingPreviousList -and -not $script:IsViewingCurrentTasks -and $null -ne $TaskList) {
+                Load-TasksIntoList -Tasks @($script:SavedTasks)
+            }
+
+            Save-Config
+            return
         }
 
-        $weeklyFile = Join-Path $archiveFolder (Get-WeekWarFileName $previousMonday)
-        $weeklyFile = Get-UniqueFilePath $weeklyFile
-
-        if ($script:SavedTasks.Count -gt 0) {
-            Write-TaskListFile `
-                -FilePath $weeklyFile `
-                -Tasks @($script:SavedTasks) `
-                -SavedLine "Saved: $(Get-Date -Format 'MM-dd-yyyy HH:mm')"
-        }
-
-        Move-PreviousWeekFilesToArchive -WeekMonday $previousMonday -ArchiveFolder $archiveFolder
-
-        $script:SavedTasks = @()
-        $script:S["LastWorkWeekMonday"] = $currentKey
-        Save-Config
+        Compile-WeeklyWarIfNeeded -WeekMonday $currentMonday -NowMountain $nowMountain
     }
     catch {}
+}
+
+function Get-InstalledScriptPath {
+    $documentsFolder = [Environment]::GetFolderPath("MyDocuments")
+    $installedFolder = Join-Path $documentsFolder "War Report Helper"
+    $installedScript = Join-Path $installedFolder "WarReportHelper.ps1"
+
+    if (Test-Path $installedScript) {
+        return $installedScript
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($PSCommandPath)) {
+        return $PSCommandPath
+    }
+
+    return (Join-Path $script:ScriptDirectory "WarReportHelper.ps1")
 }
 
 function Compare-VersionString {
@@ -1031,75 +1232,399 @@ function Compare-VersionString {
     }
 }
 
-function Get-GitHubLatestReleaseInfo {
-    $owner = [string]$script:S["UpdateRepoOwner"]
-    $repo = [string]$script:S["UpdateRepoName"]
+function Get-ScriptVersionFromText {
+    param([string]$ScriptText)
 
-    if ([string]::IsNullOrWhiteSpace($owner) -or [string]::IsNullOrWhiteSpace($repo)) {
-        throw "GitHub update repository owner or name is blank."
+    if ([string]::IsNullOrWhiteSpace($ScriptText)) {
+        throw "The update file was empty."
+    }
+
+    # Find AppVersion anywhere in the update file instead of only at the start of a line.
+    # Some restricted-network/raw GitHub paths can return compressed-looking text where
+    # `$script:AppVersion is not at the beginning of its own line.
+    $match = [regex]::Match($ScriptText, '\$script:AppVersion\s*=\s*[''"]([^''"]+)[''"]')
+
+    if (-not $match.Success) {
+        throw "The update file does not contain a valid `$script:AppVersion value."
+    }
+
+    return [string]$match.Groups[1].Value
+}
+
+function Get-ReleaseNotesFromScriptText {
+    param([string]$ScriptText)
+
+    $notes = New-Object System.Collections.ArrayList
+
+    try {
+        $blockMatch = [regex]::Match($ScriptText, '(?s)\$script:AppReleaseNotes\s*=\s*@\((.*?)\)')
+
+        if ($blockMatch.Success) {
+            $body = $blockMatch.Groups[1].Value
+            $stringMatches = [regex]::Matches($body, '[''\"]([^''\"]+)[''\"]')
+
+            foreach ($match in $stringMatches) {
+                $note = [string]$match.Groups[1].Value
+                if (-not [string]::IsNullOrWhiteSpace($note)) {
+                    [void]$notes.Add($note)
+                }
+            }
+        }
+    }
+    catch {}
+
+    if ($notes.Count -eq 0) {
+        [void]$notes.Add("Updated War Report Helper to a newer version.")
+    }
+
+    return @($notes)
+}
+
+function Get-UpdateInfoFromScriptText {
+    param(
+        [string]$ScriptText,
+        [string]$SourceName,
+        [string]$SourcePath
+    )
+
+    $latestVersion = Get-ScriptVersionFromText -ScriptText $ScriptText
+    $releaseNotes = Get-ReleaseNotesFromScriptText -ScriptText $ScriptText
+
+    return [pscustomobject]@{
+        LatestVersion = $latestVersion
+        ScriptText    = $ScriptText
+        ReleaseNotes  = @($releaseNotes)
+        UpdateUrl     = $SourcePath
+        Source        = $SourceName
+    }
+}
+
+function Get-UpdateInfoFromUrl {
+    param([string]$UpdateUrl)
+
+    if ([string]::IsNullOrWhiteSpace($UpdateUrl)) {
+        throw "The raw GitHub update URL is blank."
     }
 
     try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {}
 
-    $apiUrl = "https://api.github.com/repos/$owner/$repo/releases/latest"
     $headers = @{
-        "Accept" = "application/vnd.github+json"
+        "Accept" = "text/plain"
         "User-Agent" = "WarReportHelper/$script:AppVersion"
     }
 
-    $release = Invoke-RestMethod -Uri $apiUrl -Headers $headers -Method Get -TimeoutSec 20
-
-    $scriptAsset = $release.assets | Where-Object { $_.name -eq "WarReportHelper.ps1" } | Select-Object -First 1
-    $jsonAsset = $release.assets | Where-Object { $_.name -eq "WarReportHelper_Version.json" } | Select-Object -First 1
-
-    if ($null -eq $scriptAsset) {
-        throw "The latest release does not include WarReportHelper.ps1."
+    $webClient = New-Object System.Net.WebClient
+    foreach ($key in $headers.Keys) {
+        $webClient.Headers[$key] = [string]$headers[$key]
     }
 
-    $versionInfo = $null
-    if ($null -ne $jsonAsset) {
-        $versionInfo = Invoke-RestMethod -Uri $jsonAsset.browser_download_url -Headers @{ "User-Agent" = "WarReportHelper/$script:AppVersion" } -Method Get -TimeoutSec 20
+    try {
+        if ([System.Net.WebRequest]::DefaultWebProxy -ne $null) {
+            $webClient.Proxy = [System.Net.WebRequest]::DefaultWebProxy
+            $webClient.Proxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
+        }
+    }
+    catch {}
+
+    try {
+        $bytes = $webClient.DownloadData($UpdateUrl)
+        $scriptText = [System.Text.Encoding]::UTF8.GetString($bytes)
+    }
+    finally {
+        $webClient.Dispose()
     }
 
-    $latestVersion = $release.tag_name -replace '^v', ''
-    if ($null -ne $versionInfo -and $versionInfo.version) {
-        $latestVersion = [string]$versionInfo.version
+    return Get-UpdateInfoFromScriptText -ScriptText $scriptText -SourceName "GitHub raw" -SourcePath $UpdateUrl
+}
+
+function Get-DomainCandidateNames {
+    $domains = New-Object System.Collections.ArrayList
+
+    foreach ($value in @($env:USERDNSDOMAIN, $env:USERDOMAIN)) {
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            [void]$domains.Add([string]$value)
+        }
     }
 
-    return [pscustomobject]@{
-        Release = $release
-        VersionInfo = $versionInfo
-        LatestVersion = $latestVersion
-        ScriptUrl = [string]$scriptAsset.browser_download_url
-        ScriptAsset = $scriptAsset
-        JsonAsset = $jsonAsset
+    try {
+        $computerSystem = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+        if ($computerSystem.Domain) { [void]$domains.Add([string]$computerSystem.Domain) }
     }
+    catch {
+        try {
+            $computerSystem = Get-WmiObject -Class Win32_ComputerSystem -ErrorAction Stop
+            if ($computerSystem.Domain) { [void]$domains.Add([string]$computerSystem.Domain) }
+        }
+        catch {}
+    }
+
+    try {
+        $globalDns = Get-DnsClientGlobalSetting -ErrorAction Stop
+        foreach ($suffix in @($globalDns.SuffixSearchList)) {
+            if (-not [string]::IsNullOrWhiteSpace($suffix)) { [void]$domains.Add([string]$suffix) }
+        }
+    }
+    catch {}
+
+    try {
+        foreach ($client in @(Get-DnsClient -ErrorAction Stop)) {
+            if (-not [string]::IsNullOrWhiteSpace($client.ConnectionSpecificSuffix)) {
+                [void]$domains.Add([string]$client.ConnectionSpecificSuffix)
+            }
+        }
+    }
+    catch {}
+
+    $unique = New-Object System.Collections.ArrayList
+    foreach ($domain in $domains) {
+        $clean = ([string]$domain).Trim().TrimEnd('.').ToLowerInvariant()
+        if ([string]::IsNullOrWhiteSpace($clean)) { continue }
+        if ($clean -eq "workgroup") { continue }
+        if (-not $unique.Contains($clean)) { [void]$unique.Add($clean) }
+    }
+
+    return @($unique)
+}
+
+function Test-IsMilUpdateDomain {
+    foreach ($domain in @(Get-DomainCandidateNames)) {
+        if ($domain -eq "area52.afnoapps.usaf.mil" -or $domain.EndsWith(".mil")) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Get-NetworkUpdateCandidatePaths {
+    $folder = [string]$script:S["UpdateNetworkFolder"]
+    $fileNames = [string]$script:S["UpdateNetworkFileNames"]
+
+    if ([string]::IsNullOrWhiteSpace($folder)) {
+        throw "The network update folder is blank."
+    }
+
+    if ([string]::IsNullOrWhiteSpace($fileNames)) {
+        $fileNames = "UpdatedWarReportHelper;WarReportHelper.ps1"
+    }
+
+    $folder = $folder.Trim().TrimEnd([char[]]"\/")
+    $paths = New-Object System.Collections.ArrayList
+
+    foreach ($name in ($fileNames -split ';')) {
+        $cleanName = ([string]$name).Trim()
+        if ([string]::IsNullOrWhiteSpace($cleanName)) { continue }
+
+        if ([System.IO.Path]::IsPathRooted($cleanName)) {
+            [void]$paths.Add($cleanName)
+        }
+        else {
+            [void]$paths.Add((Join-Path $folder $cleanName))
+        }
+    }
+
+    return @($paths)
+}
+
+function Get-UpdateInfoFromNetworkFallback {
+    if (-not (Test-IsMilUpdateDomain)) {
+        $seenDomains = @(Get-DomainCandidateNames)
+        if ($seenDomains.Count -eq 0) {
+            throw "Network update fallback skipped because this computer does not appear to be connected to a .mil domain."
+        }
+
+        throw "Network update fallback skipped because this computer's detected domain/suffix is not .mil: $($seenDomains -join ', ')"
+    }
+
+    $errors = New-Object System.Collections.ArrayList
+
+    foreach ($candidatePath in @(Get-NetworkUpdateCandidatePaths)) {
+        try {
+            if (-not (Test-Path -LiteralPath $candidatePath -PathType Leaf)) {
+                [void]$errors.Add("Not found: $candidatePath")
+                continue
+            }
+
+            $scriptText = [System.IO.File]::ReadAllText($candidatePath, [System.Text.Encoding]::UTF8)
+            return Get-UpdateInfoFromScriptText -ScriptText $scriptText -SourceName "Network fallback" -SourcePath $candidatePath
+        }
+        catch {
+            [void]$errors.Add("$candidatePath - $($_.Exception.Message)")
+        }
+    }
+
+    throw "No valid network update script could be read. Checked:`n$($errors -join "`n")"
+}
+
+function Get-RawUpdateInfo {
+    $updateUrl = [string]$script:S["UpdateRawUrl"]
+    $githubError = $null
+
+    try {
+        return Get-UpdateInfoFromUrl -UpdateUrl $updateUrl
+    }
+    catch {
+        $githubError = $_.Exception.Message
+    }
+
+    try {
+        $networkInfo = Get-UpdateInfoFromNetworkFallback
+        return $networkInfo
+    }
+    catch {
+        throw "GitHub update check failed: $githubError`n`nNetwork fallback update check failed: $($_.Exception.Message)"
+    }
+}
+
+function Format-ReleaseNotesText {
+    param([object[]]$ReleaseNotes)
+
+    if ($null -eq $ReleaseNotes -or $ReleaseNotes.Count -eq 0) {
+        return "- Updated War Report Helper."
+    }
+
+    return (($ReleaseNotes | ForEach-Object { "- $_" }) -join "`n")
+}
+
+function Show-UpdatePromptWindow {
+    param(
+        [string]$LatestVersion,
+        [object[]]$ReleaseNotes
+    )
+
+    $notesText = Format-ReleaseNotesText -ReleaseNotes $ReleaseNotes
+
+    $promptXaml = @"
+<Window
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="War Report Helper Update"
+    Width="520"
+    Height="330"
+    MinWidth="480"
+    MinHeight="300"
+    WindowStartupLocation="CenterOwner"
+    ResizeMode="NoResize"
+    FontFamily="Segoe UI"
+    Background="#FFF5F7FB">
+
+    <Border x:Name="PromptRoot" Padding="18" Background="#FFF5F7FB">
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+
+            <StackPanel Grid.Row="0">
+                <TextBlock x:Name="PromptTitle" Text="Update available" FontSize="20" FontWeight="Bold" Margin="0,0,0,6"/>
+                <TextBlock x:Name="PromptSubtitle" Text="A newer version of War Report Helper is available." TextWrapping="Wrap"/>
+            </StackPanel>
+
+            <Border Grid.Row="1" x:Name="NotesBorder" Margin="0,14,0,14" Padding="12" CornerRadius="10" BorderThickness="1">
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <TextBlock x:Name="NotesTextBlock" TextWrapping="Wrap"/>
+                </ScrollViewer>
+            </Border>
+
+            <Grid Grid.Row="2">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="120"/>
+                    <ColumnDefinition Width="120"/>
+                </Grid.ColumnDefinitions>
+
+                <Button x:Name="LaterButton" Grid.Column="1" Content="Later" Height="38" Margin="0,0,8,0"/>
+                <Button x:Name="UpdateNowButton" Grid.Column="2" Content="Update Now" Height="38"/>
+            </Grid>
+        </Grid>
+    </Border>
+</Window>
+"@
+
+    $promptWindow = Read-Xaml $promptXaml
+    $promptWindow.FontFamily = [System.Windows.Media.FontFamily]::new([string]$script:S["AppFontFamily"])
+    if ($null -ne $script:MainWindow) { $promptWindow.Owner = $script:MainWindow }
+
+    $PromptRoot = $promptWindow.FindName("PromptRoot")
+    $PromptTitle = $promptWindow.FindName("PromptTitle")
+    $PromptSubtitle = $promptWindow.FindName("PromptSubtitle")
+    $NotesBorder = $promptWindow.FindName("NotesBorder")
+    $NotesTextBlock = $promptWindow.FindName("NotesTextBlock")
+    $LaterButton = $promptWindow.FindName("LaterButton")
+    $UpdateNowButton = $promptWindow.FindName("UpdateNowButton")
+
+    $promptWindow.Background = New-Brush $script:S["WindowBackgroundColor"]
+    $PromptRoot.Background = New-Brush $script:S["WindowBackgroundColor"]
+    $PromptTitle.Foreground = New-Brush $script:S["TitleFontColor"]
+    $PromptSubtitle.Foreground = New-Brush $script:S["SubtitleFontColor"]
+    $NotesBorder.Background = New-Brush $script:S["ListBackgroundColor"]
+    $NotesBorder.BorderBrush = New-Brush $script:S["WindowBorderColor"]
+    $NotesTextBlock.Foreground = New-Brush $script:S["ListFontColor"]
+    $NotesTextBlock.Text = "Current version: v$script:AppVersion`nNew version: v$LatestVersion`n`nChanges:`n$notesText"
+
+    foreach ($button in @($LaterButton, $UpdateNowButton)) {
+        $button.Foreground = New-Brush $script:S["ButtonFontColor"]
+        $button.Background = New-Brush $script:S["ButtonBackgroundColor"]
+        $button.BorderBrush = New-Brush "#FF000000"
+        $button.BorderThickness = [System.Windows.Thickness]::new(1)
+        $button.FontWeight = [System.Windows.FontWeights]::SemiBold
+    }
+
+    $choice = @{ Value = "Later" }
+
+    $LaterButton.Add_Click({
+        $choice.Value = "Later"
+        $promptWindow.Close()
+    })
+
+    $UpdateNowButton.Add_Click({
+        $choice.Value = "UpdateNow"
+        $promptWindow.Close()
+    })
+
+    [void]$promptWindow.ShowDialog()
+    return [string]$choice.Value
+}
+
+function Write-UpdateTextToTempFile {
+    param([string]$ScriptText)
+
+    $tempFolder = Join-Path ([System.IO.Path]::GetTempPath()) "WarReportHelper_Update"
+    if (-not (Test-Path $tempFolder)) {
+        [void](New-Item -ItemType Directory -Path $tempFolder -Force)
+    }
+
+    $downloadPath = Join-Path $tempFolder "WarReportHelper_New.ps1"
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($downloadPath, $ScriptText, $utf8NoBom)
+
+    return $downloadPath
 }
 
 function Check-ForUpdates {
     param(
         [switch]$Interactive,
-        [switch]$Silent
+        [switch]$Silent,
+        [switch]$Startup
     )
 
     try {
-        $info = Get-GitHubLatestReleaseInfo
+        $info = Get-RawUpdateInfo
         $comparison = Compare-VersionString $info.LatestVersion $script:AppVersion
 
         if ($comparison -gt 0) {
             $message = "Update available: v$($info.LatestVersion). Current version: v$script:AppVersion."
             Set-StatusMessage $message
 
-            if ($Interactive) {
-                $result = [System.Windows.MessageBox]::Show(
-                    "$message`n`nDo you want to update now?",
-                    "War Report Helper Update Available",
-                    [System.Windows.MessageBoxButton]::YesNo,
-                    [System.Windows.MessageBoxImage]::Question
-                )
+            if ($Interactive -or $Startup) {
+                $choice = Show-UpdatePromptWindow -LatestVersion $info.LatestVersion -ReleaseNotes $info.ReleaseNotes
 
-                if ($result -eq [System.Windows.MessageBoxResult]::Yes) {
-                    Start-AppUpdate
+                if ($choice -eq "UpdateNow") {
+                    Start-AppUpdate -UpdateInfo $info
+                }
+                else {
+                    Set-StatusMessage "Update postponed until next launch."
                 }
             }
 
@@ -1109,7 +1634,7 @@ function Check-ForUpdates {
         if ($Interactive) {
             Show-AppMessage -Message "You are already on the latest version: v$script:AppVersion" -Title "No Update Available" -Image ([System.Windows.MessageBoxImage]::Information)
         }
-        elseif (-not $Silent) {
+        elseif (-not $Silent -and -not $Startup) {
             Set-StatusMessage "No update available. Current version: v$script:AppVersion."
         }
 
@@ -1119,7 +1644,7 @@ function Check-ForUpdates {
         if ($Interactive) {
             Show-AppMessage -Message "Unable to check for updates.`n$($_.Exception.Message)" -Title "Update Check Failed" -Image ([System.Windows.MessageBoxImage]::Warning)
         }
-        elseif (-not $Silent) {
+        elseif (-not $Silent -and -not $Startup) {
             Set-StatusMessage "Update check failed."
         }
 
@@ -1128,70 +1653,79 @@ function Check-ForUpdates {
 }
 
 function Start-AppUpdate {
+    param([object]$UpdateInfo)
+
     try {
-        $info = Get-GitHubLatestReleaseInfo
-        $comparison = Compare-VersionString $info.LatestVersion $script:AppVersion
+        if ($null -eq $UpdateInfo) {
+            $UpdateInfo = Get-RawUpdateInfo
+        }
+
+        $comparison = Compare-VersionString $UpdateInfo.LatestVersion $script:AppVersion
 
         if ($comparison -le 0) {
-            $result = [System.Windows.MessageBox]::Show(
-                "The latest release appears to be v$($info.LatestVersion), and you are running v$script:AppVersion.`n`nDo you want to reinstall the latest release anyway?",
-                "Reinstall Latest Release?",
-                [System.Windows.MessageBoxButton]::YesNo,
-                [System.Windows.MessageBoxImage]::Question
-            )
-
-            if ($result -ne [System.Windows.MessageBoxResult]::Yes) { return }
+            Show-AppMessage -Message "No newer update was found. Current version: v$script:AppVersion. Latest scanned version: v$($UpdateInfo.LatestVersion)." -Title "No Update Available" -Image ([System.Windows.MessageBoxImage]::Information)
+            return
         }
-        else {
-            $notes = ""
-            if ($null -ne $info.VersionInfo -and $info.VersionInfo.releaseNotes) {
-                $notes = "`n`nRelease notes:`n" + (($info.VersionInfo.releaseNotes | ForEach-Object { "- $_" }) -join "`n")
-            }
+        $targetScript = Get-InstalledScriptPath
 
-            $result = [System.Windows.MessageBox]::Show(
-                "Install War Report Helper v$($info.LatestVersion)?$notes",
-                "Install Update",
-                [System.Windows.MessageBoxButton]::YesNo,
-                [System.Windows.MessageBoxImage]::Question
-            )
+        $downloadPath = Write-UpdateTextToTempFile -ScriptText $UpdateInfo.ScriptText
 
-            if ($result -ne [System.Windows.MessageBoxResult]::Yes) { return }
-        }
-
-        $targetScript = $PSCommandPath
-        if ([string]::IsNullOrWhiteSpace($targetScript)) {
-            $targetScript = Join-Path $script:ScriptDirectory "WarReportHelper.ps1"
-        }
-
-        $tempFolder = Join-Path ([System.IO.Path]::GetTempPath()) "WarReportHelper_Update"
-        if (-not (Test-Path $tempFolder)) { [void](New-Item -ItemType Directory -Path $tempFolder -Force) }
-
-        $downloadPath = Join-Path $tempFolder "WarReportHelper_New.ps1"
-        Invoke-WebRequest -Uri $info.ScriptUrl -OutFile $downloadPath -Headers @{ "User-Agent" = "WarReportHelper/$script:AppVersion" } -UseBasicParsing -TimeoutSec 60
-
-        if ($null -ne $info.VersionInfo -and $info.VersionInfo.sha256) {
-            $expectedHash = ([string]$info.VersionInfo.sha256).ToUpperInvariant()
-            $actualHash = (Get-FileHash -Path $downloadPath -Algorithm SHA256).Hash.ToUpperInvariant()
-
-            if ($expectedHash -ne $actualHash) {
-                throw "The downloaded update failed SHA256 verification. Expected $expectedHash but got $actualHash."
-            }
+        $parsedVersion = Get-ScriptVersionFromText -ScriptText ([System.IO.File]::ReadAllText($downloadPath))
+        if ((Compare-VersionString $parsedVersion $script:AppVersion) -le 0) {
+            throw "Downloaded update version v$parsedVersion is not newer than the installed version v$script:AppVersion."
         }
 
         $backupFolder = Join-Path $script:ScriptDirectory "Backups"
-        if (-not (Test-Path $backupFolder)) { [void](New-Item -ItemType Directory -Path $backupFolder -Force) }
+        if (-not (Test-Path $backupFolder)) {
+            [void](New-Item -ItemType Directory -Path $backupFolder -Force)
+        }
 
-        $applyScript = Join-Path $tempFolder "Apply_WarReportHelper_Update.ps1"
+        $tempFolder = Split-Path -Parent $downloadPath
+        $applyScript = Join-Path $tempFolder "Apply_WarReportHelper_RawUpdate.ps1"
         $backupName = "WarReportHelper_Backup_$(Get-Date -Format 'MM-dd-yyyy_HH-mm-ss').ps1"
         $backupPath = Join-Path $backupFolder $backupName
 
+        $markerData = [ordered]@{
+            FromVersion = $script:AppVersion
+            ToVersion = [string]$UpdateInfo.LatestVersion
+            ReleaseNotes = @($UpdateInfo.ReleaseNotes)
+        }
+        $markerJson = $markerData | ConvertTo-Json -Depth 5
+        $markerBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($markerJson))
+
+        $targetScriptB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($targetScript))
+        $downloadPathB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($downloadPath))
+        $backupPathB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($backupPath))
+        $completeFileB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($script:UpdateCompleteFile))
+
         $applyContent = @"
+`$ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 2
 try {
-    Copy-Item -Path '$targetScript' -Destination '$backupPath' -Force -ErrorAction SilentlyContinue
-    Copy-Item -Path '$downloadPath' -Destination '$targetScript' -Force -ErrorAction Stop
-    Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-STA','-File','$targetScript')
+    `$targetScript = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$targetScriptB64'))
+    `$downloadPath = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$downloadPathB64'))
+    `$backupPath = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$backupPathB64'))
+    `$completeFile = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$completeFileB64'))
+
+    for (`$i = 0; `$i -lt 20; `$i++) {
+        try {
+            `$stream = [System.IO.File]::Open(`$targetScript, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+            `$stream.Close()
+            break
+        }
+        catch {
+            Start-Sleep -Milliseconds 300
+        }
+    }
+
+    Copy-Item -Path `$targetScript -Destination `$backupPath -Force -ErrorAction SilentlyContinue
+    Copy-Item -Path `$downloadPath -Destination `$targetScript -Force -ErrorAction Stop
+    `$markerJson = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$markerBase64'))
+    [System.IO.File]::WriteAllText(`$completeFile, `$markerJson, [System.Text.Encoding]::UTF8)
+
+    `$launchArgs = '-NoProfile -ExecutionPolicy Bypass -STA -File "' + `$targetScript + '" -ShowUpdateComplete'
+    Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList `$launchArgs
 }
 catch {
     [System.Windows.Forms.MessageBox]::Show('The War Report Helper update failed: ' + `$_.Exception.Message, 'Update Failed') | Out-Null
@@ -1200,13 +1734,32 @@ catch {
 
         $applyContent | Set-Content -Path $applyScript -Encoding UTF8
 
-        Set-StatusMessage "Applying update to v$($info.LatestVersion)..."
-        Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File', $applyScript)
+        Set-StatusMessage "Applying update to v$($UpdateInfo.LatestVersion)..."
+        $applyArgs = '-NoProfile -ExecutionPolicy Bypass -File "' + $applyScript + '"'
+        Start-Process -FilePath powershell.exe -WindowStyle Hidden -ArgumentList $applyArgs
         $script:MainWindow.Close()
     }
     catch {
         Show-AppMessage -Message "The update could not be installed.`n$($_.Exception.Message)" -Title "Update Failed" -Image ([System.Windows.MessageBoxImage]::Error)
     }
+}
+
+function Show-UpdateCompleteNotice {
+    try {
+        if (-not (Test-Path $script:UpdateCompleteFile)) { return }
+
+        $data = Get-Content $script:UpdateCompleteFile -Raw | ConvertFrom-Json
+        Remove-Item $script:UpdateCompleteFile -Force -ErrorAction SilentlyContinue
+
+        $notes = @($data.ReleaseNotes)
+        if ($notes.Count -eq 0) { $notes = @("Updated War Report Helper.") }
+
+        $notesText = Format-ReleaseNotesText -ReleaseNotes $notes
+        $message = "War Report Helper updated successfully.`n`nPrevious version: v$($data.FromVersion)`nCurrent version: v$($data.ToVersion)`n`nChanges:`n$notesText"
+
+        Show-AppMessage -Message $message -Title "Update Complete" -Image ([System.Windows.MessageBoxImage]::Information)
+    }
+    catch {}
 }
 
 function Start-StartupUpdateCheck {
@@ -1217,7 +1770,7 @@ function Start-StartupUpdateCheck {
         $timer.Interval = [TimeSpan]::FromSeconds(5)
         $timer.Add_Tick({
             $this.Stop()
-            Check-ForUpdates -Silent | Out-Null
+            Check-ForUpdates -Startup -Silent | Out-Null
         })
         $timer.Start()
     }
@@ -1298,8 +1851,8 @@ $mainXaml = @"
             <Setter Property="Background" Value="Transparent"/>
             <Setter Property="BorderBrush" Value="Transparent"/>
             <Setter Property="BorderThickness" Value="0"/>
-            <Setter Property="FontFamily" Value="Segoe UI Symbol"/>
-            <Setter Property="FontSize" Value="18"/>
+            <Setter Property="FontFamily" Value="Segoe UI"/>
+            <Setter Property="FontSize" Value="15"/>
             <Setter Property="FontWeight" Value="Bold"/>
             <Setter Property="Padding" Value="0"/>
             <Setter Property="Cursor" Value="Hand"/>
@@ -1314,8 +1867,8 @@ $mainXaml = @"
                             SnapsToDevicePixels="True">
                             <Ellipse
                                 x:Name="HoverCircle"
-                                Width="31"
-                                Height="31"
+                                Width="30"
+                                Height="30"
                                 HorizontalAlignment="Center"
                                 VerticalAlignment="Center"
                                 Fill="Transparent"
@@ -1326,7 +1879,7 @@ $mainXaml = @"
                                 VerticalAlignment="Center"
                                 RecognizesAccessKey="True">
                                 <ContentPresenter.RenderTransform>
-                                    <TranslateTransform Y="-1"/>
+                                    <TranslateTransform Y="0"/>
                                 </ContentPresenter.RenderTransform>
                             </ContentPresenter>
                         </Grid>
@@ -1349,8 +1902,8 @@ $mainXaml = @"
 
         <Style x:Key="EditTaskButtonStyle" TargetType="{x:Type Button}">
             <Setter Property="Visibility" Value="Collapsed"/>
-            <Setter Property="Width" Value="34"/>
-            <Setter Property="Height" Value="26"/>
+            <Setter Property="Width" Value="58"/>
+            <Setter Property="Height" Value="28"/>
             <Setter Property="Padding" Value="0"/>
             <Setter Property="Margin" Value="8,0,0,0"/>
             <Setter Property="Foreground" Value="{DynamicResource EditButtonTextBrush}"/>
@@ -1360,6 +1913,49 @@ $mainXaml = @"
             <Setter Property="FontWeight" Value="Bold"/>
             <Setter Property="Cursor" Value="Hand"/>
             <Setter Property="ToolTip" Value="Edit this task"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="{x:Type Button}">
+                        <Border
+                            Background="{TemplateBinding Background}"
+                            BorderBrush="{TemplateBinding BorderBrush}"
+                            BorderThickness="{TemplateBinding BorderThickness}"
+                            CornerRadius="7">
+                            <ContentPresenter
+                                HorizontalAlignment="Center"
+                                VerticalAlignment="Center"/>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding IsMouseOver, RelativeSource={RelativeSource AncestorType=ListBoxItem}}" Value="True">
+                    <Setter Property="Visibility" Value="Visible"/>
+                </DataTrigger>
+                <DataTrigger Binding="{Binding IsSelected, RelativeSource={RelativeSource AncestorType=ListBoxItem}}" Value="True">
+                    <Setter Property="Visibility" Value="Visible"/>
+                </DataTrigger>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Opacity" Value="0.85"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+
+
+
+        <Style x:Key="CounterTaskButtonStyle" TargetType="{x:Type Button}">
+            <Setter Property="Visibility" Value="Collapsed"/>
+            <Setter Property="Width" Value="28"/>
+            <Setter Property="Height" Value="26"/>
+            <Setter Property="Padding" Value="0"/>
+            <Setter Property="Margin" Value="6,0,0,0"/>
+            <Setter Property="Foreground" Value="{DynamicResource EditButtonTextBrush}"/>
+            <Setter Property="Background" Value="{DynamicResource EditButtonBackgroundBrush}"/>
+            <Setter Property="BorderBrush" Value="Black"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="FontWeight" Value="Bold"/>
+            <Setter Property="FontSize" Value="15"/>
+            <Setter Property="Cursor" Value="Hand"/>
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="{x:Type Button}">
@@ -1491,21 +2087,31 @@ $mainXaml = @"
                     HorizontalAlignment="Right">
                     <Button
                         x:Name="MinimizeWindowButton"
-                        Content="−"
+                        Content="-"
                         Width="46"
                         Height="34"
                         Style="{StaticResource TopBarButton}"
                         ToolTip="Minimize"/>
                     <Button
                         x:Name="MaximizeWindowButton"
-                        Content="▢"
                         Width="46"
                         Height="34"
                         Style="{StaticResource TopBarButton}"
-                        ToolTip="Maximize or restore"/>
+                        ToolTip="Maximize or restore">
+                        <Canvas Width="14" Height="14" HorizontalAlignment="Center" VerticalAlignment="Center">
+                            <Rectangle
+                                Width="10"
+                                Height="10"
+                                Canvas.Left="2"
+                                Canvas.Top="2"
+                                Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"
+                                StrokeThickness="2"
+                                Fill="Transparent"/>
+                        </Canvas>
+                    </Button>
                     <Button
                         x:Name="CloseWindowButton"
-                        Content="×"
+                        Content="X"
                         Width="46"
                         Height="34"
                         Style="{StaticResource TopBarButton}"
@@ -1648,7 +2254,7 @@ $mainXaml = @"
                                 Height="38"
                                 Margin="0,0,0,8"
                                 Style="{StaticResource ModernButton}"
-                                ToolTip="Check GitHub Releases for a newer version"/>
+                                ToolTip="Check the configured raw GitHub update file for a newer version"/>
 
                             <Button
                                 x:Name="HelpPopupButton"
@@ -1664,13 +2270,13 @@ $mainXaml = @"
             <Button
                 x:Name="ToggleButton"
                 Grid.Row="1"
-                Content="Hide Completed Tasks"
+                Content="Show Current Tasks"
                 Width="180"
                 Height="38"
                 HorizontalAlignment="Left"
                 Margin="0,0,0,12"
                 Style="{StaticResource ModernButton}"
-                ToolTip="Hide or show the completed task list"/>
+                ToolTip="Switch between Completed Tasks and Current Tasks"/>
 
             <TextBlock
                 x:Name="ListHeaderText"
@@ -1691,12 +2297,16 @@ $mainXaml = @"
                     x:Name="TaskList"
                     BorderThickness="0"
                     Background="Transparent"
-                    ScrollViewer.VerticalScrollBarVisibility="Auto">
+                    ScrollViewer.VerticalScrollBarVisibility="Auto"
+                    ScrollViewer.HorizontalScrollBarVisibility="Disabled">
                     <ListBox.ItemTemplate>
                         <DataTemplate>
                             <Grid>
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="Auto"/>
                                     <ColumnDefinition Width="Auto"/>
                                     <ColumnDefinition Width="Auto"/>
                                 </Grid.ColumnDefinitions>
@@ -1705,17 +2315,39 @@ $mainXaml = @"
                                     Grid.Column="0"
                                     Text="{Binding}"
                                     VerticalAlignment="Center"
-                                    TextWrapping="Wrap"/>
+                                    TextWrapping="Wrap"
+                                    Margin="0,0,10,0"/>
 
                                 <Button
                                     Grid.Column="1"
+                                    Content="-"
+                                    Tag="DecreaseTaskCount"
+                                    ToolTip="Decrease this task count"
+                                    Style="{StaticResource CounterTaskButtonStyle}"/>
+
+                                <Button
+                                    Grid.Column="2"
+                                    Content="+"
+                                    Tag="IncreaseTaskCount"
+                                    ToolTip="Increase this task count"
+                                    Style="{StaticResource CounterTaskButtonStyle}"/>
+
+                                <Button
+                                    Grid.Column="3"
+                                    Content="Move"
+                                    Tag="MoveTask"
+                                    ToolTip="Move this task between Current Tasks and Completed Tasks"
+                                    Style="{StaticResource EditTaskButtonStyle}"/>
+
+                                <Button
+                                    Grid.Column="4"
                                     Content="Edit"
                                     Tag="EditTask"
                                     Style="{StaticResource EditTaskButtonStyle}"/>
 
                                 <Button
-                                    Grid.Column="2"
-                                    Content="✕"
+                                    Grid.Column="5"
+                                    Content="X"
                                     Tag="DeleteTask"
                                     Style="{StaticResource DeleteTaskButtonStyle}"/>
                             </Grid>
@@ -2068,7 +2700,17 @@ function Update-DynamicListFontSizing {
 
 function Update-TaskCount {
     $count = $TaskList.Items.Count
-    $ListHeaderText.Text = "Completed Tasks ($count)"
+
+    if ($script:IsViewingPreviousList) {
+        $ListHeaderText.Text = "Previous List Tasks ($count)"
+    }
+    elseif ($script:IsViewingCurrentTasks) {
+        $ListHeaderText.Text = "Current Tasks ($count)"
+    }
+    else {
+        $ListHeaderText.Text = "Completed Tasks ($count)"
+    }
+
     Update-DynamicListFontSizing
 }
 
@@ -2080,11 +2722,19 @@ function Update-DefaultStatus {
         $autoSaveStatus = "On, every $($script:S["AutoSaveIntervalMinutes"]) minute(s)"
     }
 
+    $modeText = "completed task(s) today"
+    if ($script:IsViewingPreviousList) {
+        $modeText = "task(s) in previous list"
+    }
+    elseif ($script:IsViewingCurrentTasks) {
+        $modeText = "current task(s) in progress"
+    }
+
     if ($null -ne $script:LastSaveTime) {
-        Set-StatusMessage "$count task(s) completed today | Last saved: $($script:LastSaveTime.ToString('hh:mm tt')) | Auto-save: $autoSaveStatus"
+        Set-StatusMessage "$count $modeText | Last saved: $($script:LastSaveTime.ToString('hh:mm tt')) | Auto-save: $autoSaveStatus"
     }
     else {
-        Set-StatusMessage "$count task(s) completed today | Auto-save: $autoSaveStatus"
+        Set-StatusMessage "$count $modeText | Auto-save: $autoSaveStatus"
     }
 }
 
@@ -2107,13 +2757,13 @@ function Update-AutoSaveTimer {
 }
 
 function Apply-ListVisibility {
-    if ($script:S["ListVisible"]) {
-        $ListCard.Visibility = [System.Windows.Visibility]::Visible
-        $ListRow.Height = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
+    $ListCard.Visibility = [System.Windows.Visibility]::Visible
+    $ListRow.Height = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
 
+    if ($script:IsViewingPreviousList) {
         Set-ButtonDisplay `
             -Button $ToggleButton `
-            -Text "Hide Completed Tasks" `
+            -Text "Show Current Tasks" `
             -IconPath $script:S["ToggleIconPath"] `
             -TextWidth 180 `
             -TextHeight 38 `
@@ -2121,23 +2771,53 @@ function Apply-ListVisibility {
             -IconHorizontalAlignment "Left" `
             -MaxIconSize 28
 
-        $ToggleButton.ToolTip = "Hide the completed task list"
+        $ToggleButton.ToolTip = "Return to today before switching task lists"
+        return
     }
-    else {
-        $ListCard.Visibility = [System.Windows.Visibility]::Collapsed
-        $ListRow.Height = [System.Windows.GridLength]::new(0)
 
+    if ($script:IsViewingCurrentTasks) {
         Set-ButtonDisplay `
             -Button $ToggleButton `
             -Text "Show Completed Tasks" `
             -IconPath $script:S["ToggleIconPath"] `
+            -TextWidth 190 `
+            -TextHeight 38 `
+            -TextHorizontalAlignment "Left" `
+            -IconHorizontalAlignment "Left" `
+            -MaxIconSize 28
+
+        $ToggleButton.ToolTip = "Show the completed tasks list"
+    }
+    else {
+        Set-ButtonDisplay `
+            -Button $ToggleButton `
+            -Text "Show Current Tasks" `
+            -IconPath $script:S["ToggleIconPath"] `
             -TextWidth 180 `
             -TextHeight 38 `
             -TextHorizontalAlignment "Left" `
             -IconHorizontalAlignment "Left" `
             -MaxIconSize 28
 
-        $ToggleButton.ToolTip = "Show the completed task list"
+        $ToggleButton.ToolTip = "Show the tasks currently being worked on"
+    }
+}
+
+function Update-TaskEntryModeText {
+    if ($script:IsViewingPreviousList) {
+        $InputHeaderText.Text = "Add a task to this previous list"
+        $InputPlaceholder.Text = "Type a task for the opened list..."
+        $SubmitButton.ToolTip = "Add this task to the opened previous list"
+    }
+    elseif ($script:IsViewingCurrentTasks) {
+        $InputHeaderText.Text = "Add a current task"
+        $InputPlaceholder.Text = "Type a task currently being worked on..."
+        $SubmitButton.ToolTip = "Add this task to Current Tasks"
+    }
+    else {
+        $InputHeaderText.Text = "Add a completed task"
+        $InputPlaceholder.Text = "Type a completed task here..."
+        $SubmitButton.ToolTip = "Add this task to Completed Tasks"
     }
 }
 
@@ -2146,6 +2826,11 @@ function Apply-Settings {
     Register-ButtonPressAnimation $MaximizeWindowButton
     Register-ButtonPressAnimation $CloseWindowButton
 
+    if ([string]::IsNullOrWhiteSpace([string]$script:S["AppFontFamily"])) {
+        $script:S["AppFontFamily"] = "Nunito, Segoe UI"
+    }
+
+    $script:MainWindow.FontFamily = [System.Windows.Media.FontFamily]::new([string]$script:S["AppFontFamily"])
     $script:MainWindow.Background = New-Brush $script:S["WindowBackgroundColor"]
     $ShellGrid.Background = New-Brush $script:S["WindowBackgroundColor"]
     $CustomTitleBar.Background = New-Brush $script:S["WindowBorderColor"]
@@ -2237,15 +2922,16 @@ function Apply-Settings {
 
     $SettingsButton.ToolTip = "Open options menu"
     $ReturnTodayButton.ToolTip = "Return to the current day's task list"
-    $SubmitButton.ToolTip = "Add this task to the completed task list"
-    $TaskInput.ToolTip = "Type a completed task, then press Submit or Enter"
+    $SubmitButton.ToolTip = "Add this task to the currently displayed task list"
+    $TaskInput.ToolTip = "Type a task, then press Submit or Enter"
     $OpenSettingsPopupButton.ToolTip = "Open customization and export settings"
     $SaveListPopupButton.ToolTip = "Choose where to save a copy of the task list"
     $OpenPreviousListPopupButton.ToolTip = "Open a previously saved task list without replacing today's tasks"
-    $CheckUpdatesPopupButton.ToolTip = "Check GitHub Releases for a newer version"
+    $CheckUpdatesPopupButton.ToolTip = "Check the configured raw GitHub update file for a newer version"
     $HelpPopupButton.ToolTip = "Show how to use this app"
 
     Apply-ListVisibility
+    Update-TaskEntryModeText
     Update-TaskCount
     Update-Placeholder
     Update-DateDisplay
@@ -2259,9 +2945,7 @@ function Submit-Task {
     if ($newTask -ne "") {
         $newTask = $newTask -replace "(`r`n|`n|`r)+", " "
 
-        if (-not $newTask.StartsWith("•")) {
-            $newTask = "• $newTask"
-        }
+        $newTask = Normalize-TaskText $newTask
 
         [void]$TaskList.Items.Add($newTask)
         $TaskInput.Clear()
@@ -2277,7 +2961,12 @@ function Submit-Task {
         if ($script:IsViewingPreviousList) {
             Set-StatusMessage "Task added to previous list. Changes are not saved to that file yet."
         }
+        elseif ($script:IsViewingCurrentTasks) {
+            $script:CurrentTasks = @(Get-CurrentTasks)
+            Set-StatusMessage "Current task added. $($TaskList.Items.Count) task(s) in progress."
+        }
         else {
+            $script:SavedTasks = @(Get-CurrentTasks)
             Set-StatusMessage "Task added. $($TaskList.Items.Count) task(s) completed today."
         }
     }
@@ -2311,12 +3000,104 @@ function Normalize-TaskText {
     param([string]$Text)
 
     $value = $Text.Trim() -replace "(`r`n|`n|`r)+", " "
+    $legacyBullet = [string][char]0x2022
 
-    if ($value -ne "" -and -not $value.StartsWith("•")) {
-        $value = "• $value"
+    if ($value.StartsWith($legacyBullet)) {
+        $value = $value.Substring(1).TrimStart()
+    }
+    elseif ($value.StartsWith("- ")) {
+        return $value
+    }
+    elseif ($value.StartsWith("-")) {
+        $value = $value.Substring(1).TrimStart()
+    }
+
+    if ($value -ne "") {
+        $value = "- $value"
     }
 
     return $value
+}
+
+
+function Get-TaskCountInfo {
+    param([string]$TaskText)
+
+    $text = [string]$TaskText
+    $count = 1
+    $baseText = $text.TrimEnd()
+
+    $match = [regex]::Match($baseText, '\s+\(x(\d+)\)\s*$')
+
+    if ($match.Success) {
+        $parsed = 1
+        if ([int]::TryParse($match.Groups[1].Value, [ref]$parsed)) {
+            $count = [Math]::Max(1, $parsed)
+            $baseText = $baseText.Substring(0, $match.Index).TrimEnd()
+        }
+    }
+
+    return [pscustomobject]@{
+        BaseText = $baseText
+        Count    = $count
+    }
+}
+
+function Set-TaskCountText {
+    param(
+        [string]$BaseText,
+        [int]$Count
+    )
+
+    $cleanBase = Normalize-TaskText $BaseText
+    $safeCount = [Math]::Max(1, [int]$Count)
+
+    if ($safeCount -le 1) {
+        return $cleanBase
+    }
+
+    return "$cleanBase (x$safeCount)"
+}
+
+function Change-TaskCounter {
+    param(
+        [int]$Index,
+        [int]$Delta
+    )
+
+    if ($Index -lt 0 -or $Index -ge $TaskList.Items.Count) {
+        return
+    }
+
+    $currentTask = [string]$TaskList.Items[$Index]
+    $info = Get-TaskCountInfo -TaskText $currentTask
+    $newCount = [Math]::Max(1, ([int]$info.Count + [int]$Delta))
+    $newText = Set-TaskCountText -BaseText $info.BaseText -Count $newCount
+
+    $TaskList.Items[$Index] = $newText
+
+    if ($script:IsViewingPreviousList) {
+        Mark-DisplayedListDirty
+    }
+    elseif ($script:IsViewingCurrentTasks) {
+        $script:CurrentTasks = @(Get-CurrentTasks)
+    }
+    else {
+        $script:SavedTasks = @(Get-CurrentTasks)
+    }
+
+    Save-Config
+    Update-TaskCount
+
+    if ($script:IsViewingPreviousList) {
+        Set-StatusMessage "Previous list task count updated to x$newCount. Changes are not saved to that file yet."
+    }
+    elseif ($script:IsViewingCurrentTasks) {
+        Set-StatusMessage "Current task count updated to x$newCount."
+    }
+    else {
+        Set-StatusMessage "Task count updated to x$newCount."
+    }
 }
 
 function Show-EditTaskWindow {
@@ -2390,6 +3171,7 @@ function Show-EditTaskWindow {
 
     $editWindow = Read-Xaml $editXaml
     $editWindow.Owner = $script:MainWindow
+    $editWindow.FontFamily = [System.Windows.Media.FontFamily]::new([string]$script:S["AppFontFamily"])
 
     $EditRoot = $editWindow.FindName("EditRoot")
     $EditLabel = $editWindow.FindName("EditLabel")
@@ -2414,10 +3196,14 @@ function Show-EditTaskWindow {
     }
 
     $cleanOriginal = [string]$OriginalTask
-    if ($cleanOriginal.StartsWith("• ")) {
+    $legacyBullet = [string][char]0x2022
+    if ($cleanOriginal.StartsWith("- ")) {
         $cleanOriginal = $cleanOriginal.Substring(2)
     }
-    elseif ($cleanOriginal.StartsWith("•")) {
+    elseif ($cleanOriginal.StartsWith("-")) {
+        $cleanOriginal = $cleanOriginal.Substring(1).Trim()
+    }
+    elseif ($cleanOriginal.StartsWith($legacyBullet)) {
         $cleanOriginal = $cleanOriginal.Substring(1).Trim()
     }
 
@@ -2494,6 +3280,193 @@ function Set-DadJokeText {
     catch {}
 }
 
+function Convert-GitHubBlobUrlToRawUrl {
+    param([string]$Url)
+
+    if ([string]::IsNullOrWhiteSpace($Url)) {
+        return $Url
+    }
+
+    try {
+        $trimmedUrl = $Url.Trim()
+
+        if ($trimmedUrl -match '^https://github\.com/([^/]+)/([^/]+)/blob/([^/]+)/(.*)$') {
+            $owner = $matches[1]
+            $repo = $matches[2]
+            $branch = $matches[3]
+            $path = $matches[4]
+            return "https://raw.githubusercontent.com/$owner/$repo/refs/heads/$branch/$path"
+        }
+
+        return $trimmedUrl
+    }
+    catch {
+        return $Url
+    }
+}
+
+function Decode-DadJokeJsonStringValue {
+    param([string]$Value)
+
+    if ($null -eq $Value) {
+        return ""
+    }
+
+    try {
+        # The GitHub dadjokes file may contain actual newlines inside a quoted JSON value.
+        # Escape those control characters before asking ConvertFrom-Json to decode \uXXXX, \" and similar sequences.
+        $safeValue = [string]$Value
+        $safeValue = $safeValue -replace "`r`n", "\n"
+        $safeValue = $safeValue -replace "`n", "\n"
+        $safeValue = $safeValue -replace "`r", "\n"
+
+        $jsonString = '"' + $safeValue + '"'
+        return [string]($jsonString | ConvertFrom-Json)
+    }
+    catch {
+        return [string]$Value
+    }
+}
+
+function Select-DadJokeFromRawText {
+    param([string]$RawText)
+
+    $jokes = New-Object System.Collections.ArrayList
+
+    function Add-DadJokeCandidate {
+        param([object]$Candidate)
+
+        if ($null -eq $Candidate) {
+            return
+        }
+
+        $candidateText = [string]$Candidate
+        $candidateText = $candidateText -replace "`r`n", " "
+        $candidateText = $candidateText -replace "`n", " "
+        $candidateText = $candidateText -replace "`r", " "
+        $candidateText = [regex]::Replace($candidateText, "\s+", " ").Trim()
+
+        if (-not [string]::IsNullOrWhiteSpace($candidateText)) {
+            [void]$jokes.Add($candidateText)
+        }
+    }
+
+    function Add-DadJokesFromMalformedJsonLikeText {
+        param([string]$Text)
+
+        if ([string]::IsNullOrWhiteSpace($Text)) {
+            return
+        }
+
+        # Handles the GitHub-hosted dadjokes file even if joke strings contain literal line breaks,
+        # which makes the file fail strict JSON parsing. It extracts each "joke" value up to the next object.
+        $pattern = '(?s)"joke"\s*:\s*"(?<joke>.*?)(?="\s*\}\s*,\s*\{\s*"id"\s*:|"\s*\}\s*\]\s*\}|"\s*\}\s*$)'
+        $matches = [regex]::Matches($Text, $pattern)
+
+        foreach ($match in $matches) {
+            if ($match.Success) {
+                $rawJoke = [string]$match.Groups['joke'].Value
+                $decodedJoke = Decode-DadJokeJsonStringValue $rawJoke
+                Add-DadJokeCandidate $decodedJoke
+            }
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($RawText)) {
+        return $script:DadJokeFallback
+    }
+
+    try {
+        $trimmed = $RawText.Trim()
+        $trimmed = $trimmed.Trim([char]0xFEFF)
+
+        if ($trimmed.StartsWith("{") -or $trimmed.StartsWith("[")) {
+            try {
+                $jsonRoot = $trimmed | ConvertFrom-Json -Depth 20
+                $items = @()
+
+                if ($jsonRoot -is [System.Array]) {
+                    $items = @($jsonRoot)
+                }
+                elseif ($null -ne $jsonRoot.jokes) {
+                    $items = @($jsonRoot.jokes)
+                }
+                elseif ($null -ne $jsonRoot.items) {
+                    $items = @($jsonRoot.items)
+                }
+                else {
+                    $items = @($jsonRoot)
+                }
+
+                foreach ($item in $items) {
+                    if ($item -is [string]) {
+                        Add-DadJokeCandidate $item
+                    }
+                    elseif ($null -ne $item.jokeBase64) {
+                        try {
+                            $decodedBytes = [Convert]::FromBase64String([string]$item.jokeBase64)
+                            Add-DadJokeCandidate ([System.Text.Encoding]::UTF8.GetString($decodedBytes))
+                        }
+                        catch {}
+                    }
+                    elseif ($null -ne $item.joke) {
+                        Add-DadJokeCandidate $item.joke
+                    }
+                    elseif ($null -ne $item.text) {
+                        Add-DadJokeCandidate $item.text
+                    }
+                    elseif ($null -ne $item.value) {
+                        Add-DadJokeCandidate $item.value
+                    }
+                }
+            }
+            catch {
+                Add-DadJokesFromMalformedJsonLikeText $trimmed
+            }
+        }
+        elseif ($trimmed -match "(?m)^\s*---JOKE---\s*$") {
+            $blocks = $trimmed -split "(?m)^\s*---JOKE---\s*$"
+
+            foreach ($block in $blocks) {
+                Add-DadJokeCandidate $block
+            }
+        }
+        elseif ($trimmed -match "(?m)^\s*WRH-DADJOKE\|") {
+            $lines = $trimmed -split "`r?`n"
+
+            foreach ($line in $lines) {
+                if ($line -match '^\s*WRH-DADJOKE\|[^|]*\|(?<payload>.+?)\s*$') {
+                    try {
+                        $bytes = [Convert]::FromBase64String($matches['payload'])
+                        Add-DadJokeCandidate ([System.Text.Encoding]::UTF8.GetString($bytes))
+                    }
+                    catch {}
+                }
+            }
+        }
+        elseif ($trimmed -match '"joke"\s*:') {
+            Add-DadJokesFromMalformedJsonLikeText $trimmed
+        }
+        else {
+            # Legacy fallback: one joke per line.
+            $lines = $RawText -split "`r?`n"
+
+            foreach ($line in $lines) {
+                Add-DadJokeCandidate $line
+            }
+        }
+    }
+    catch {
+        return $script:DadJokeFallback
+    }
+
+    if ($jokes.Count -le 0) {
+        return $script:DadJokeFallback
+    }
+
+    return [string](Get-Random -InputObject @($jokes))
+}
+
 function Start-DadJokeLoad {
     if ($null -eq $script:JokeBlockControl) {
         return
@@ -2512,9 +3485,19 @@ function Start-DadJokeLoad {
             try { $script:DadJokeWebClient.Dispose() } catch {}
         }
 
+        $jokeUrl = [string]$script:S["DadJokesRawUrl"]
+
+        if ([string]::IsNullOrWhiteSpace($jokeUrl)) {
+            $jokeUrl = "https://raw.githubusercontent.com/LSmaroff/WarReportHelper/refs/heads/main/jokes/dadjokes"
+        }
+
+        $jokeUrl = Convert-GitHubBlobUrlToRawUrl $jokeUrl
+
         $client = New-Object System.Net.WebClient
+        $client.Encoding = [System.Text.Encoding]::UTF8
         $client.Headers.Add("Accept", "text/plain")
-        $client.Headers.Add("User-Agent", "WarReportHelper Task Tracker")
+        $client.Headers.Add("Cache-Control", "no-cache")
+        $client.Headers.Add("User-Agent", "WarReportHelper/$script:AppVersion")
         $script:DadJokeWebClient = $client
 
         $client.add_DownloadStringCompleted({
@@ -2524,11 +3507,7 @@ function Start-DadJokeLoad {
 
             try {
                 if (-not $eventArgs.Cancelled -and $null -eq $eventArgs.Error) {
-                    $apiText = ([string]$eventArgs.Result).Trim()
-
-                    if (-not [string]::IsNullOrWhiteSpace($apiText)) {
-                        $finalJoke = $apiText
-                    }
+                    $finalJoke = Select-DadJokeFromRawText -RawText ([string]$eventArgs.Result)
                 }
             }
             catch {
@@ -2540,7 +3519,7 @@ function Start-DadJokeLoad {
             try { $sender.Dispose() } catch {}
         })
 
-        $client.DownloadStringAsync([Uri]"https://icanhazdadjoke.com/")
+        $client.DownloadStringAsync([Uri]$jokeUrl)
     }
     catch {
         Set-DadJokeText $script:DadJokeFallback
@@ -2585,7 +3564,7 @@ function Get-ThemeColorKeys {
 }
 
 function Get-ThemeFontKeys {
-    return @("TitleFontSize", "SubtitleFontSize", "SectionLabelFontSize", "ListFontSize", "InputFontSize")
+    return @("TitleFontSize", "SubtitleFontSize", "SectionLabelFontSize", "ListFontSize", "InputFontSize", "AppFontFamily")
 }
 
 function New-ThemeSettings {
@@ -2858,6 +3837,7 @@ function Open-SettingsWindow {
 
     $settingsWindow = Read-Xaml $settingsXaml
     $settingsWindow.Owner = $script:MainWindow
+    $settingsWindow.FontFamily = [System.Windows.Media.FontFamily]::new([string]$temp["AppFontFamily"])
     $settingsPanel = $settingsWindow.FindName("SettingsPanel")
 
     $temp = @{}
@@ -2866,6 +3846,7 @@ function Open-SettingsWindow {
     }
 
     $builtInThemes = Get-BuiltInThemes
+    $fontSelectorPopupBorder = $null
     $settingsButtons = New-Object System.Collections.ArrayList
     $sizeBoxes = @{}
     $colorPreviews = New-Object System.Collections.ArrayList
@@ -3181,6 +4162,7 @@ function Open-SettingsWindow {
 
     function Update-ThemePreview {
         if ($previewControls.Count -eq 0) { return }
+        if ($previewControls.ContainsKey("Root")) { $previewControls.Root.FontFamily = [System.Windows.Media.FontFamily]::new([string]$temp["AppFontFamily"]) }
 
         $previewControls.Root.Background = New-Brush $temp["WindowBackgroundColor"]
         $previewControls.Root.BorderBrush = New-Brush $temp["WindowBorderColor"]
@@ -3204,6 +4186,8 @@ function Open-SettingsWindow {
     }
 
     function Apply-SettingsWindowVisuals {
+        if ([string]::IsNullOrWhiteSpace([string]$temp["AppFontFamily"])) { $temp["AppFontFamily"] = "Nunito, Segoe UI" }
+        $settingsWindow.FontFamily = [System.Windows.Media.FontFamily]::new([string]$temp["AppFontFamily"])
         $settingsWindow.Background = New-Brush $temp["WindowBackgroundColor"]
         $settingsPanel.Background = New-Brush $temp["WindowBackgroundColor"]
 
@@ -3229,6 +4213,11 @@ function Open-SettingsWindow {
         if ($null -ne $themeSelectorPopupBorder) {
             $themeSelectorPopupBorder.Background = New-Brush $temp["WindowBackgroundColor"]
             $themeSelectorPopupBorder.BorderBrush = New-Brush $temp["WindowBorderColor"]
+        }
+
+        if ($null -ne $fontSelectorPopupBorder) {
+            $fontSelectorPopupBorder.Background = New-Brush $temp["WindowBackgroundColor"]
+            $fontSelectorPopupBorder.BorderBrush = New-Brush $temp["WindowBorderColor"]
         }
 
         foreach ($button in $settingsButtons) {
@@ -3381,6 +4370,82 @@ function Open-SettingsWindow {
 
     Add-TwoColumnRow $appearance "Theme preset" $themeSelectorGrid
 
+    $fontSelectorGrid = New-Object System.Windows.Controls.Grid
+    $fontSelectorGrid.Margin = [System.Windows.Thickness]::new(0, 0, 0, 8)
+
+    $fontSelectorButton = New-SettingsButton "Font: $($temp["AppFontFamily"])"
+    $fontSelectorButton.Height = 38
+    $fontSelectorButton.HorizontalAlignment = "Stretch"
+    $fontSelectorButton.ToolTip = "Choose the app font"
+    [void]$fontSelectorGrid.Children.Add($fontSelectorButton)
+
+    $fontSelectorPopup = New-Object System.Windows.Controls.Primitives.Popup
+    $fontSelectorPopup.PlacementTarget = $fontSelectorButton
+    $fontSelectorPopup.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Bottom
+    $fontSelectorPopup.AllowsTransparency = $true
+    $fontSelectorPopup.StaysOpen = $false
+    $fontSelectorPopup.PopupAnimation = [System.Windows.Controls.Primitives.PopupAnimation]::Slide
+
+    $fontSelectorPopupBorder = New-Object System.Windows.Controls.Border
+    $fontSelectorPopupBorder.Width = 245
+    $fontSelectorPopupBorder.MaxHeight = 260
+    $fontSelectorPopupBorder.BorderThickness = [System.Windows.Thickness]::new(1)
+    $fontSelectorPopupBorder.CornerRadius = [System.Windows.CornerRadius]::new(12)
+    $fontSelectorPopupBorder.Padding = [System.Windows.Thickness]::new(8)
+    $fontSelectorPopupBorder.Margin = [System.Windows.Thickness]::new(0, 6, 0, 0)
+
+    $fontSelectorScroll = New-Object System.Windows.Controls.ScrollViewer
+    $fontSelectorScroll.VerticalScrollBarVisibility = [System.Windows.Controls.ScrollBarVisibility]::Auto
+    $fontSelectorList = New-Object System.Windows.Controls.StackPanel
+    $fontSelectorScroll.Content = $fontSelectorList
+    $fontSelectorPopupBorder.Child = $fontSelectorScroll
+    $fontSelectorPopup.Child = $fontSelectorPopupBorder
+    [void]$fontSelectorGrid.Children.Add($fontSelectorPopup)
+
+    function Add-FontSelectorOption {
+        param([string]$FontName)
+
+        $fontOptionButton = New-SettingsButton $FontName
+        $fontOptionButton.Height = 34
+        $fontOptionButton.HorizontalAlignment = "Stretch"
+        $fontOptionButton.Margin = [System.Windows.Thickness]::new(0, 0, 0, 6)
+        $fontOptionButton.Tag = $FontName
+
+        try {
+            $fontOptionButton.FontFamily = [System.Windows.Media.FontFamily]::new($FontName)
+        }
+        catch {}
+
+        $fontOptionButton.Add_Click({
+            $selectedFont = [string]$this.Tag
+            if (-not [string]::IsNullOrWhiteSpace($selectedFont)) {
+                $temp["AppFontFamily"] = $selectedFont
+                $fontSelectorButton.Content = "Font: $selectedFont"
+                Apply-SettingsWindowVisuals
+                Set-StatusMessage "Previewing font: $selectedFont"
+            }
+            $fontSelectorPopup.IsOpen = $false
+        })
+
+        [void]$fontSelectorList.Children.Add($fontOptionButton)
+    }
+
+    foreach ($fontName in $script:AvailableFontFamilies) {
+        Add-FontSelectorOption -FontName $fontName
+    }
+
+    if (-not ($script:AvailableFontFamilies -contains [string]$temp["AppFontFamily"])) {
+        Add-FontSelectorOption -FontName ([string]$temp["AppFontFamily"])
+    }
+
+    $fontSelectorButton.Add_Click({
+        Apply-SettingsWindowVisuals
+        $fontSelectorPopup.PlacementTarget = $fontSelectorButton
+        $fontSelectorPopup.IsOpen = -not $fontSelectorPopup.IsOpen
+    })
+
+    Add-TwoColumnRow $appearance "App font" $fontSelectorGrid
+
     Add-ActionColorRow $appearance "Accent Color" "AccentColor" "Accent"
     Add-ColorRow $appearance "WindowBackgroundColor" "Main Background"
     Add-ActionColorRow $appearance "Main Text Color" "TitleFontColor" "MainText"
@@ -3447,7 +4512,7 @@ function Open-SettingsWindow {
     $previewListBox.Child = $previewListStack
 
     $previewTaskText = New-Object System.Windows.Controls.TextBlock
-    $previewTaskText.Text = "• Example completed task"
+    $previewTaskText.Text = "- Example completed task"
     $previewTaskText.Margin = [System.Windows.Thickness]::new(0, 0, 0, 6)
     [void]$previewListStack.Children.Add($previewTaskText)
 
@@ -3456,27 +4521,27 @@ function Open-SettingsWindow {
     $previewHoverRow.Padding = [System.Windows.Thickness]::new(8, 5, 8, 5)
     $hoverGrid = New-Object System.Windows.Controls.Grid
     $previewHoverRow.Child = $hoverGrid
-    foreach ($width in @("*", "64", "42")) {
+    foreach ($width in @("*", "84", "58")) {
         $col = New-Object System.Windows.Controls.ColumnDefinition
         if ($width -eq "*") { $col.Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star) } else { $col.Width = [System.Windows.GridLength]::new([double]$width) }
         [void]$hoverGrid.ColumnDefinitions.Add($col)
     }
     $previewHoverText = New-Object System.Windows.Controls.TextBlock
-    $previewHoverText.Text = "• Hovered task"
+    $previewHoverText.Text = "- Hovered task"
     $previewHoverText.VerticalAlignment = "Center"
     [System.Windows.Controls.Grid]::SetColumn($previewHoverText, 0)
     [void]$hoverGrid.Children.Add($previewHoverText)
     $previewEditButton = New-SettingsButton "Edit"
-    $previewEditButton.Width = 56
-    $previewEditButton.Height = 30
+    $previewEditButton.Width = 76
+    $previewEditButton.Height = 34
     $previewEditButton.Padding = [System.Windows.Thickness]::new(0)
     $previewEditButton.Margin = [System.Windows.Thickness]::new(6, 0, 4, 0)
     $previewEditButton.VerticalAlignment = "Center"
     [System.Windows.Controls.Grid]::SetColumn($previewEditButton, 1)
     [void]$hoverGrid.Children.Add($previewEditButton)
-    $previewDeleteButton = New-SettingsButton "✕"
-    $previewDeleteButton.Width = 34
-    $previewDeleteButton.Height = 30
+    $previewDeleteButton = New-SettingsButton "X"
+    $previewDeleteButton.Width = 50
+    $previewDeleteButton.Height = 34
     $previewDeleteButton.Padding = [System.Windows.Thickness]::new(0)
     $previewDeleteButton.Margin = [System.Windows.Thickness]::new(4, 0, 0, 0)
     $previewDeleteButton.VerticalAlignment = "Center"
@@ -3755,11 +4820,14 @@ function Open-SettingsWindow {
     $currentVersionLabel.Margin = [System.Windows.Thickness]::new(0, 0, 0, 8)
     [void]$updates.Children.Add($currentVersionLabel)
 
-    $updateRepoOwnerBox = New-SettingsTextBox ([string]$temp["UpdateRepoOwner"])
-    Add-TwoColumnRow $updates "GitHub owner" $updateRepoOwnerBox
+    $updateRawUrlBox = New-SettingsTextBox ([string]$temp["UpdateRawUrl"])
+    Add-TwoColumnRow $updates "Raw update URL" $updateRawUrlBox
 
-    $updateRepoNameBox = New-SettingsTextBox ([string]$temp["UpdateRepoName"])
-    Add-TwoColumnRow $updates "GitHub repository" $updateRepoNameBox
+    $networkUpdateFolderBox = New-SettingsTextBox ([string]$temp["UpdateNetworkFolder"])
+    Add-TwoColumnRow $updates "Network fallback folder" $networkUpdateFolderBox
+
+    $networkUpdateFilesBox = New-SettingsTextBox ([string]$temp["UpdateNetworkFileNames"])
+    Add-TwoColumnRow $updates "Network fallback files" $networkUpdateFilesBox
 
     $startupUpdateCheckBox = New-Object System.Windows.Controls.CheckBox
     $startupUpdateCheckBox.Content = "Check for updates on startup"
@@ -3789,32 +4857,36 @@ function Open-SettingsWindow {
     [void]$updates.Children.Add($updateButtonGrid)
 
     $updateStatusText = New-Object System.Windows.Controls.TextBlock
-    $updateStatusText.Text = "Uses GitHub Releases: https://github.com/$($temp["UpdateRepoOwner"])/$($temp["UpdateRepoName"])/releases/latest"
+    $updateStatusText.Text = "Scans GitHub first. If GitHub is unavailable, .mil/domain-connected machines check the network fallback folder."
     $updateStatusText.FontSize = 12
     $updateStatusText.TextWrapping = "Wrap"
     $updateStatusText.Margin = [System.Windows.Thickness]::new(0, 8, 0, 0)
     [void]$updates.Children.Add($updateStatusText)
 
     $checkNowButton.Add_Click({
-        $oldOwner = $script:S["UpdateRepoOwner"]
-        $oldRepo = $script:S["UpdateRepoName"]
+        $oldUrl = $script:S["UpdateRawUrl"]
+        $oldNetworkFolder = $script:S["UpdateNetworkFolder"]
+        $oldNetworkFileNames = $script:S["UpdateNetworkFileNames"]
         try {
-            $script:S["UpdateRepoOwner"] = $updateRepoOwnerBox.Text.Trim()
-            $script:S["UpdateRepoName"] = $updateRepoNameBox.Text.Trim()
-            $updateStatusText.Text = "Checking GitHub releases..."
+            $script:S["UpdateRawUrl"] = $updateRawUrlBox.Text.Trim()
+            $script:S["UpdateNetworkFolder"] = $networkUpdateFolderBox.Text.Trim()
+            $script:S["UpdateNetworkFileNames"] = $networkUpdateFilesBox.Text.Trim()
+            $updateStatusText.Text = "Checking GitHub, then .mil network fallback if needed..."
             $hasUpdate = Check-ForUpdates -Interactive
-            if ($hasUpdate) { $updateStatusText.Text = "Update available. Use Update Now to install." }
+            if ($hasUpdate) { $updateStatusText.Text = "Update available. Use Update Now to install, or use the update prompt." }
             else { $updateStatusText.Text = "No update available for v$script:AppVersion." }
         }
         finally {
-            $script:S["UpdateRepoOwner"] = $oldOwner
-            $script:S["UpdateRepoName"] = $oldRepo
+            $script:S["UpdateRawUrl"] = $oldUrl
+            $script:S["UpdateNetworkFolder"] = $oldNetworkFolder
+            $script:S["UpdateNetworkFileNames"] = $oldNetworkFileNames
         }
     })
 
     $updateNowButton.Add_Click({
-        $script:S["UpdateRepoOwner"] = $updateRepoOwnerBox.Text.Trim()
-        $script:S["UpdateRepoName"] = $updateRepoNameBox.Text.Trim()
+        $script:S["UpdateRawUrl"] = $updateRawUrlBox.Text.Trim()
+        $script:S["UpdateNetworkFolder"] = $networkUpdateFolderBox.Text.Trim()
+        $script:S["UpdateNetworkFileNames"] = $networkUpdateFilesBox.Text.Trim()
         $script:S["CheckForUpdatesOnStartup"] = [bool]$startupUpdateCheckBox.IsChecked
         Save-Config
         Start-AppUpdate
@@ -3880,8 +4952,9 @@ function Open-SettingsWindow {
             $exportDirectoryBox.Text = $script:S["ExportDirectory"]
         }
         $script:S["DynamicListFontSizing"] = [bool]$dynamicListFontCheckBox.IsChecked
-        $script:S["UpdateRepoOwner"] = $updateRepoOwnerBox.Text.Trim()
-        $script:S["UpdateRepoName"] = $updateRepoNameBox.Text.Trim()
+        $script:S["UpdateRawUrl"] = $updateRawUrlBox.Text.Trim()
+        $script:S["UpdateNetworkFolder"] = $networkUpdateFolderBox.Text.Trim()
+        $script:S["UpdateNetworkFileNames"] = $networkUpdateFilesBox.Text.Trim()
         $script:S["CheckForUpdatesOnStartup"] = [bool]$startupUpdateCheckBox.IsChecked
         $script:S["AutoSaveEnabled"] = [bool]$autoSaveCheckBox.IsChecked
         $script:S["AutoSaveIntervalMinutes"] = Get-ClampedInt $autoSaveIntervalBox.Text $script:S["AutoSaveIntervalMinutes"] 1 1440
@@ -4026,8 +5099,14 @@ $HelpPopupButton.Add_Click({
 })
 
 $ToggleButton.Add_Click({
-    $script:S["ListVisible"] = -not [bool]$script:S["ListVisible"]
-    Apply-ListVisibility
+    if ($script:IsViewingPreviousList) {
+        Set-StatusMessage "Return to Today before switching between Current Tasks and Completed Tasks."
+        return
+    }
+
+    Save-DisplayedTasksToMemory
+    $script:IsViewingCurrentTasks = -not [bool]$script:IsViewingCurrentTasks
+    Refresh-DisplayedTaskList
     Save-Config
 })
 
@@ -4076,12 +5155,30 @@ $TaskList.AddHandler(
             return
         }
 
-        if ([string]$button.Tag -eq "DeleteTask") {
+        if ([string]$button.Tag -eq "MoveTask") {
+            Move-TaskBetweenCurrentAndCompleted -Index $index
+            $e.Handled = $true
+        }
+        elseif ([string]$button.Tag -eq "IncreaseTaskCount") {
+            Change-TaskCounter -Index $index -Delta 1
+            $e.Handled = $true
+        }
+        elseif ([string]$button.Tag -eq "DecreaseTaskCount") {
+            Change-TaskCounter -Index $index -Delta -1
+            $e.Handled = $true
+        }
+        elseif ([string]$button.Tag -eq "DeleteTask") {
             $removedTask = [string]$TaskList.Items[$index]
             $TaskList.Items.RemoveAt($index)
 
             if ($script:IsViewingPreviousList) {
                 Mark-DisplayedListDirty
+            }
+            elseif ($script:IsViewingCurrentTasks) {
+                $script:CurrentTasks = @(Get-CurrentTasks)
+            }
+            else {
+                $script:SavedTasks = @(Get-CurrentTasks)
             }
 
             Save-Config
@@ -4089,6 +5186,9 @@ $TaskList.AddHandler(
 
             if ($script:IsViewingPreviousList) {
                 Set-StatusMessage "Deleted task from previous list. Changes are not saved to that file yet."
+            }
+            elseif ($script:IsViewingCurrentTasks) {
+                Set-StatusMessage "Deleted current task: $removedTask"
             }
             else {
                 Set-StatusMessage "Deleted task: $removedTask"
@@ -4098,13 +5198,20 @@ $TaskList.AddHandler(
         }
         elseif ([string]$button.Tag -eq "EditTask") {
             $originalTask = [string]$TaskList.Items[$index]
-            $editResult = Show-EditTaskWindow $originalTask
+            $taskInfo = Get-TaskCountInfo -TaskText $originalTask
+            $editResult = Show-EditTaskWindow $taskInfo.BaseText
 
             if ($editResult.Saved) {
-                $TaskList.Items[$index] = [string]$editResult.Text
+                $TaskList.Items[$index] = Set-TaskCountText -BaseText ([string]$editResult.Text) -Count ([int]$taskInfo.Count)
 
                 if ($script:IsViewingPreviousList) {
                     Mark-DisplayedListDirty
+                }
+                elseif ($script:IsViewingCurrentTasks) {
+                    $script:CurrentTasks = @(Get-CurrentTasks)
+                }
+                else {
+                    $script:SavedTasks = @(Get-CurrentTasks)
                 }
 
                 Save-Config
@@ -4112,6 +5219,9 @@ $TaskList.AddHandler(
 
                 if ($script:IsViewingPreviousList) {
                     Set-StatusMessage "Previous list task updated. Changes are not saved to that file yet."
+                }
+                elseif ($script:IsViewingCurrentTasks) {
+                    Set-StatusMessage "Current task updated."
                 }
                 else {
                     Set-StatusMessage "Task updated."
@@ -4145,7 +5255,9 @@ $script:MainWindow.Add_PreviewMouseDown({
 # -----------------------------
 $script:AutoSaveTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:AutoSaveTimer.Add_Tick({
+    Save-DisplayedTasksToMemory
     Save-TaskList
+    Initialize-WorkWeekTracking
     Save-Config
 })
 
@@ -4160,7 +5272,9 @@ $script:MainWindow.Add_Closing({
         return
     }
 
+    Save-DisplayedTasksToMemory
     Save-TaskList
+    Initialize-WorkWeekTracking
     Save-Config
 })
 
@@ -4170,11 +5284,13 @@ $script:MainWindow.Add_SizeChanged({
 
 $script:MainWindow.Add_Loaded({
     Update-DynamicListFontSizing
+    Initialize-WorkWeekTracking
     Start-DadJokeLoad
 })
 
 Apply-Settings
 Update-DefaultStatus
+Show-UpdateCompleteNotice
 Start-StartupUpdateCheck
 
 [void]$script:MainWindow.ShowDialog()
